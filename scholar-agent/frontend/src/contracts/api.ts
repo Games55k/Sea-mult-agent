@@ -84,10 +84,16 @@ export interface PlanResponse {
   message: string;
   plan_graph: PlanGraph;
   intent_context?: IntentContext;
+  session_id?: string;
+  anon_user_id?: string;
+  user_id?: string;
 }
 
 export interface ChatResponse {
   response: string;
+  session_id?: string;
+  anon_user_id?: string;
+  user_id?: string;
 }
 
 export interface ExecutePlanResponse {

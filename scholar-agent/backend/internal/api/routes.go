@@ -203,7 +203,10 @@ func CORSMiddleware() gin.HandlerFunc {
 			c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Writer.Header().Set(
+			"Access-Control-Allow-Headers",
+			"Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-User-Id, X-Session-Id",
+		)
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
 
 		if c.Request.Method == "OPTIONS" {
@@ -258,8 +261,8 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			userID := ensureAnonUserIDCookie(c)
-			sessionID := ensureSessionIDCookie(c)
+			userID := resolveUserID(c)
+			sessionID := resolveSessionID(c)
 			if strings.TrimSpace(payload.Message) != "" {
 				intentClassifier.RecordTurn(c.Request.Context(), userID, sessionID, Intent.StoredTurn{
 					Role:    "user",
@@ -284,6 +287,7 @@ func SetupRoutes(r *gin.Engine) {
 				"response":     response,
 				"session_id":   sessionID,
 				"anon_user_id": userID,
+				"user_id":      userID,
 			})
 		})
 
@@ -343,8 +347,8 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			userID := ensureAnonUserIDCookie(c)
-			sessionID := ensureSessionIDCookie(c)
+			userID := resolveUserID(c)
+			sessionID := resolveSessionID(c)
 
 			intentCtx, err := inferIntentContextLLMFirst(c.Request.Context(), intentClassifier, userID, sessionID, payload.Intent)
 			if err != nil {
@@ -408,6 +412,7 @@ func SetupRoutes(r *gin.Engine) {
 				"intent_context": intentCtx,
 				"session_id":     sessionID,
 				"anon_user_id":   userID,
+				"user_id":        userID,
 			}
 
 			if c.Query("include_legacy_plan") == "true" {

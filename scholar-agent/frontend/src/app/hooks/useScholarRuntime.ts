@@ -22,7 +22,8 @@ type ExecutionAction =
   | { type: 'close-task' }
   | { type: 'patch-task-state'; taskId: string; updater: (prev: NodeExecutionState) => NodeExecutionState }
   | { type: 'set-display-mode'; mode: ExecutionDisplayMode }
-  | { type: 'set-executing'; value: boolean };
+  | { type: 'set-executing'; value: boolean }
+  | { type: 'reset' };
 
 const initialNodeExecutionState: NodeExecutionState = { logs: '', result: '', code: '', imageBase64: '' };
 
@@ -63,6 +64,13 @@ const executionReducer = (state: ExecutionState, action: ExecutionAction): Execu
       return { ...state, displayMode: action.mode };
     case 'set-executing':
       return { ...state, isExecuting: action.value };
+    case 'reset':
+      return {
+        selectedTask: null,
+        nodeStates: {},
+        displayMode: 'logs',
+        isExecuting: false,
+      };
     default:
       return state;
   }
@@ -381,6 +389,21 @@ export function useScholarRuntime(options: UseScholarRuntimeOptions) {
     [],
   );
 
+  const setDisplayMode = useCallback(
+    (mode: ExecutionDisplayMode) => {
+      dispatchExecution({ type: 'set-display-mode', mode });
+    },
+    [],
+  );
+
+  const closeTaskPanel = useCallback(() => {
+    dispatchExecution({ type: 'close-task' });
+  }, []);
+
+  const resetRuntimeState = useCallback(() => {
+    dispatchExecution({ type: 'reset' });
+  }, []);
+
   return {
     executionState,
     selectedTaskState,
@@ -389,7 +412,8 @@ export function useScholarRuntime(options: UseScholarRuntimeOptions) {
     handleExecuteTask,
     handleRunAllTasks,
     appendSelectedTaskLog,
-    setDisplayMode: (mode: ExecutionDisplayMode) => dispatchExecution({ type: 'set-display-mode', mode }),
-    closeTaskPanel: () => dispatchExecution({ type: 'close-task' }),
+    setDisplayMode,
+    closeTaskPanel,
+    resetRuntimeState,
   };
 }

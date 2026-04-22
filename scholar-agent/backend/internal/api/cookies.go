@@ -14,6 +14,8 @@ import (
 const (
 	anonUserCookieName = "sa_uid"
 	sessionCookieName  = "sa_sid"
+	userIDHeaderName   = "X-User-Id"
+	sessionHeaderName  = "X-Session-Id"
 )
 
 func ensureAnonUserIDCookie(c *gin.Context) string {
@@ -28,6 +30,17 @@ func ensureAnonUserIDCookie(c *gin.Context) string {
 	return id
 }
 
+func resolveUserID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if headerValue := sanitizeIdentityValue(c.GetHeader(userIDHeaderName)); headerValue != "" {
+		setHTTPOnlyCookie(c, anonUserCookieName, headerValue, cookieMaxAgeSeconds())
+		return headerValue
+	}
+	return ensureAnonUserIDCookie(c)
+}
+
 func ensureSessionIDCookie(c *gin.Context) string {
 	if c == nil {
 		return ""
@@ -38,6 +51,17 @@ func ensureSessionIDCookie(c *gin.Context) string {
 	id := uuid.NewString()
 	setHTTPOnlyCookie(c, sessionCookieName, id, cookieMaxAgeSeconds())
 	return id
+}
+
+func resolveSessionID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if headerValue := sanitizeIdentityValue(c.GetHeader(sessionHeaderName)); headerValue != "" {
+		setHTTPOnlyCookie(c, sessionCookieName, headerValue, cookieMaxAgeSeconds())
+		return headerValue
+	}
+	return ensureSessionIDCookie(c)
 }
 
 func cookieMaxAgeSeconds() int {
@@ -79,4 +103,30 @@ func parseSameSite(raw string) http.SameSite {
 	default:
 		return http.SameSiteLaxMode
 	}
+}
+
+func sanitizeIdentityValue(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	builder := strings.Builder{}
+	builder.Grow(len(raw))
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '-' || r == '_' || r == '.' || r == '@':
+			builder.WriteRune(r)
+		}
+		if builder.Len() >= 128 {
+			break
+		}
+	}
+	return builder.String()
 }

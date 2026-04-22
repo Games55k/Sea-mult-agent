@@ -85,6 +85,7 @@ Rules:
    verify_result, render_plot, general_research, general_synthesis, general_process.
 3. Each node must include:
    ref, name, type, assigned_to, description, dependencies, required_artifacts, output_artifacts, parallelizable, priority.
+3.5. name must be bilingual Chinese/English in the format "中文 / English". Keep the English part concise and executable.
 4. dependencies must reference prior node refs, never IDs.
 5. required_artifacts must be produced by prior nodes.
 6. For code execution or experiment tasks, prefer explicit environment steps:
@@ -92,6 +93,11 @@ Rules:
 7. For framework comparison, independent framework branches should be runnable in parallel and should join only at the reporting node.
 8. For framework comparison, each framework branch must own its own generated_code, dependency_spec, runtime_session, prepared_runtime, and metrics artifacts.
 8. For paper reproduction, include environment preparation and execution as separate steps.
+8.5. For paper reproduction that needs open-source implementation, include a dedicated repo_discovery node before repo_prepare.
+8.6. repo_discovery must follow this deterministic workflow in its description:
+     Papers with Code search -> candidate repositories -> validation/ranking -> fallback GitHub search -> final repo_url.
+8.7. repo_discovery must require parsed_paper and should output candidate_repositories, repo_validation_report, repo_url.
+8.8. repo_prepare should depend on repo_discovery and consume repo_url (and repo_validation_report if present).
 9. Keep the DAG minimal but executable.
 10. If plotting or reporting is requested, include dedicated downstream nodes for them.
 
@@ -195,11 +201,14 @@ func materializePlannerNodes(blueprints []plannerNodeBlueprint, intent models.In
 }
 
 func buildPlannerNodeDescription(rawIntent string, bp plannerNodeBlueprint) string {
+	if bp.Type == "repo_discovery" {
+		return buildRepoDiscoveryDescription(rawIntent)
+	}
 	detail := strings.TrimSpace(bp.Description)
 	if detail == "" {
 		detail = bp.Name
 	}
-	return fmt.Sprintf("任务目标: %s\n具体要求: %s\n用户原始意图: %s", bp.Name, detail, rawIntent)
+	return fmt.Sprintf("任务目标: %s\n具体要求: %s\n用户原始意图: %s", bilingualTaskName(bp.Name), detail, rawIntent)
 }
 
 func normalizeAssignedTo(value string) string {
@@ -242,6 +251,7 @@ func normalizePlannerBlueprint(bp plannerNodeBlueprint) plannerNodeBlueprint {
 	bp.Dependencies = cleanStringSlice(bp.Dependencies)
 	bp.RequiredArtifacts = cleanStringSlice(bp.RequiredArtifacts)
 	bp.OutputArtifacts = cleanStringSlice(bp.OutputArtifacts)
+	bp = applyPlannerNodeDefaults(bp)
 	return bp
 }
 
@@ -369,4 +379,34 @@ func normalizePlannerAssignedTo(bp plannerNodeBlueprint) string {
 	default:
 		return bp.AssignedTo
 	}
+}
+
+func applyPlannerNodeDefaults(bp plannerNodeBlueprint) plannerNodeBlueprint {
+	switch bp.Type {
+	case "repo_discovery":
+		bp.RequiredArtifacts = ensureArtifacts(bp.RequiredArtifacts, "parsed_paper")
+		bp.OutputArtifacts = ensureArtifacts(bp.OutputArtifacts, "candidate_repositories", "repo_validation_report", "repo_url")
+		if strings.TrimSpace(bp.Description) == "" {
+			bp.Description = buildRepoDiscoveryDescription("请根据归一化意图检索论文对应的公开实现仓库。")
+		}
+	case "repo_prepare":
+		bp.RequiredArtifacts = ensureArtifacts(bp.RequiredArtifacts, "repo_url")
+		bp.OutputArtifacts = ensureArtifacts(bp.OutputArtifacts, "generated_code")
+	}
+	return bp
+}
+
+func ensureArtifacts(current []string, required ...string) []string {
+	existing := make(map[string]struct{}, len(current))
+	out := append([]string(nil), current...)
+	for _, item := range current {
+		existing[item] = struct{}{}
+	}
+	for _, item := range required {
+		if _, ok := existing[item]; ok {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }

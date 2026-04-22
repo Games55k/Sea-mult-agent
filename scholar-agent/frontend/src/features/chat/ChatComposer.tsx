@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, Send, Sparkles } from 'lucide-react';
 interface ChatComposerProps {
   prompt: string;
   loading: boolean;
+  isLoggedIn: boolean;
   showSuggestions: boolean;
   setPrompt: (value: string) => void;
   setShowSuggestions: (next: boolean) => void;
@@ -18,7 +19,7 @@ const suggestions = [
 ];
 
 export function ChatComposer(props: ChatComposerProps) {
-  const { prompt, loading, showSuggestions, setPrompt, setShowSuggestions, onSendMessage } = props;
+  const { prompt, loading, isLoggedIn, showSuggestions, setPrompt, setShowSuggestions, onSendMessage } = props;
 
   return (
     <div className="p-4 bg-white border-t border-gray-200">
@@ -57,7 +58,11 @@ export function ChatComposer(props: ChatComposerProps) {
               onSendMessage();
             }
           }}
-          placeholder="例如：帮我用 LangChain 和 LlamaIndex 做一个 RAG 框架的对比评测..."
+          placeholder={
+            isLoggedIn
+              ? '例如：帮我用 LangChain 和 LlamaIndex 做一个 RAG 框架的对比评测...'
+              : '游客模式下也可直接提问；登录后会持久保存会话记录'
+          }
           className="flex-1 resize-none rounded-xl border border-gray-300 p-3 pr-12 focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm bg-gray-50 focus:bg-white transition-all"
           rows={3}
         />

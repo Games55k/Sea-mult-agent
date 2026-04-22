@@ -44,11 +44,26 @@ interface LeftWorkspaceChatProps {
     loading: boolean;
     prompt: string;
     showSuggestions: boolean;
+    isLoggedIn: boolean;
+    userId: string | null;
+    loginInput: string;
+    activeSessionId: string | null;
+    sessions: Array<{
+      id: string;
+      title: string;
+      createdAt: string;
+      updatedAt: string;
+      messageCount: number;
+    }>;
   };
   chatActions: {
     setPrompt: (value: string) => void;
     setShowSuggestions: (next: boolean) => void;
     onSendMessage: () => void;
+    setLoginInput: (value: string) => void;
+    onLogin: () => void;
+    onCreateSession: () => void;
+    onSwitchSession: (sessionId: string) => void;
   };
   pdfActions: {
     onOpenPdf: () => void;

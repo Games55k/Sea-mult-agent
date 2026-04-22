@@ -131,10 +131,11 @@ func createMockTask(name, agent string, deps []string, context string) *models.T
 	if deps == nil {
 		deps = []string{}
 	}
+	displayName := bilingualTaskName(name)
 	return &models.Task{
 		ID:           uuid.New().String(),
-		Name:         name,
-		Description:  fmt.Sprintf("任务目标: %s\n具体要求: %s", name, context),
+		Name:         displayName,
+		Description:  fmt.Sprintf("任务目标: %s\n具体要求: %s", displayName, context),
 		AssignedTo:   agent,
 		Status:       models.StatusPending,
 		Dependencies: deps,
@@ -155,11 +156,12 @@ func newNode(name, taskType, agent string, deps, requiredArtifacts, outputArtifa
 	}
 
 	now := time.Now()
+	displayName := bilingualTaskName(name)
 	return &models.TaskNode{
 		ID:                uuid.New().String(),
-		Name:              name,
+		Name:              displayName,
 		Type:              taskType,
-		Description:       fmt.Sprintf("任务目标: %s\n具体要求: %s", name, context),
+		Description:       fmt.Sprintf("任务目标: %s\n具体要求: %s", displayName, context),
 		AssignedTo:        agent,
 		Status:            models.StatusPending,
 		Dependencies:      deps,
@@ -204,7 +206,7 @@ func buildPaperReproductionNodes(context string) []*models.TaskNode {
 	needsFix := hasAny(normalized, "debug", "fix", "修复", "排查", "不一致")
 
 	t1 := newNode("Parse Paper & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
-	t2 := newNode("Locate Reference Repository", "repo_discovery", "coder_agent", []string{t1.ID}, []string{"parsed_paper"}, []string{"repo_url"}, true, context)
+	t2 := newRepoDiscoveryNode([]string{t1.ID}, context)
 	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url"}, []string{"workspace_path"}, false, context)
 	t4 := newNode("Setup Runtime Environment", "env_setup", "sandbox_agent", []string{t3.ID}, []string{"workspace_path"}, []string{"runtime_env"}, false, context)
 	t5 := newNode("Execute Baseline", "baseline_run", "sandbox_agent", []string{t4.ID}, []string{"runtime_env"}, []string{"run_metrics"}, false, context)
@@ -494,8 +496,8 @@ func buildPaperReproductionNodesV2(intent models.IntentContext) []*models.TaskNo
 	paperTitle := stringEntity(intent.Entities, "paper_title", "Paper")
 
 	t1 := newNode("Parse "+paperTitle+" & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
-	t2 := newNode("Locate Reference Repository", "repo_discovery", "coder_agent", []string{t1.ID}, []string{"parsed_paper"}, []string{"repo_url"}, true, context)
-	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url"}, []string{"generated_code"}, false, context)
+	t2 := newRepoDiscoveryNode([]string{t1.ID}, context)
+	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "repo_validation_report"}, []string{"generated_code"}, false, context)
 	t4 := newNode("Resolve "+paperTitle+" Dependencies", "resolve_dependencies", "coder_agent", []string{t3.ID}, []string{"generated_code"}, []string{"dependency_spec"}, false, context)
 	t5 := newNode("Setup Runtime Environment", "prepare_runtime", "sandbox_agent", []string{t4.ID}, []string{"dependency_spec"}, []string{"runtime_session"}, false, context)
 	t6 := newNode("Install "+paperTitle+" Dependencies", "install_dependencies", "sandbox_agent", []string{t5.ID}, []string{"runtime_session", "dependency_spec"}, []string{"prepared_runtime", "dependency_install_report"}, false, context)
@@ -676,6 +678,118 @@ func frameworkArtifactPrefix(framework string, index int) string {
 	return normalized
 }
 
+func newRepoDiscoveryNode(deps []string, context string) *models.TaskNode {
+	node := newNode(
+		"Retrieve Paper Repositories",
+		"repo_discovery",
+		"coder_agent",
+		deps,
+		[]string{"parsed_paper"},
+		[]string{"candidate_repositories", "repo_validation_report", "repo_url"},
+		true,
+		context,
+	)
+	// 这里用固定流程覆盖默认描述，确保仓库检索节点不再只是“让 LLM 猜一个链接”。
+	node.Description = buildRepoDiscoveryDescription(context)
+	return node
+}
+
+func buildRepoDiscoveryDescription(rawIntent string) string {
+	return "任务目标: 检索并定位论文对应的高可信公开仓库 / Retrieve and validate the most relevant public repository for the target paper\n" +
+		"具体要求:\n" +
+		"1. 优先使用 Papers with Code，根据论文标题、arXiv ID 或方法名检索论文记录。\n" +
+		"2. 若命中论文，则读取其关联代码仓库列表，整理候选仓库。\n" +
+		"3. 若 Papers with Code 无结果或结果不足，再使用 GitHub 搜索作为回退来源。\n" +
+		"4. 对候选仓库做规则校验与排序：公开可访问、仓库名/README 与论文标题或方法名匹配、实现说明清晰、活跃度合理。\n" +
+		"5. 输出结构化结果：candidate_repositories（候选仓库列表）、repo_validation_report（筛选与排序依据）、repo_url（最终选中的仓库 URL）。\n" +
+		"6. 若没有高置信仓库，必须明确说明未找到可靠公开实现，不要编造链接。\n" +
+		"用户原始意图: " + rawIntent
+}
+
+func bilingualTaskName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return name
+	}
+	if strings.Contains(trimmed, " / ") {
+		return trimmed
+	}
+
+	if zh, ok := exactTaskNameTranslations()[trimmed]; ok {
+		return zh + " / " + trimmed
+	}
+
+	switch {
+	case strings.HasPrefix(trimmed, "Analyze ") && strings.HasSuffix(trimmed, " Fit"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Analyze "), " Fit")
+		return fmt.Sprintf("分析 %s 适配性 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Prepare ") && strings.HasSuffix(trimmed, " Environment"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Prepare "), " Environment")
+		return fmt.Sprintf("准备 %s 环境 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Prepare ") && strings.HasSuffix(trimmed, " Runtime"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Prepare "), " Runtime")
+		return fmt.Sprintf("准备 %s 运行环境 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Generate ") && strings.HasSuffix(trimmed, " Benchmark Code"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Generate "), " Benchmark Code")
+		return fmt.Sprintf("生成 %s 基准测试代码 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Resolve ") && strings.HasSuffix(trimmed, " Dependencies"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Resolve "), " Dependencies")
+		return fmt.Sprintf("解析 %s 依赖 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Install ") && strings.HasSuffix(trimmed, " Dependencies"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Install "), " Dependencies")
+		return fmt.Sprintf("安装 %s 依赖 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Run ") && strings.HasSuffix(trimmed, " Benchmark"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Run "), " Benchmark")
+		return fmt.Sprintf("运行 %s 基准测试 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Parse ") && strings.HasSuffix(trimmed, " & Extract Method"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Parse "), " & Extract Method")
+		return fmt.Sprintf("解析 %s 并提取方法 / %s", target, trimmed)
+	case strings.HasPrefix(trimmed, "Read ") && strings.HasSuffix(trimmed, " Context"):
+		target := strings.TrimSuffix(strings.TrimPrefix(trimmed, "Read "), " Context")
+		return fmt.Sprintf("阅读 %s 背景 / %s", target, trimmed)
+	}
+
+	return trimmed
+}
+
+func exactTaskNameTranslations() map[string]string {
+	return map[string]string{
+		"Research Candidate Frameworks":     "调研候选框架",
+		"Generate Selection Recommendation": "生成选型建议",
+		"Generate Benchmark Report":         "生成基准测试报告",
+		"Locate Reference Repository":       "定位参考仓库",
+		"Prepare Workspace":                 "准备工作区",
+		"Setup Runtime Environment":         "搭建运行环境",
+		"Execute Baseline":                  "执行基线实验",
+		"Compare With Paper Claims":         "对比论文声明结果",
+		"Visualize Reproduction Results":    "可视化复现实验结果",
+		"Fix Gaps And Rerun":                "修复问题并重新运行",
+		"Generate Code":                     "生成代码",
+		"Resolve Dependencies":              "解析依赖",
+		"Prepare Runtime":                   "准备运行环境",
+		"Install Dependencies":              "安装依赖",
+		"Execute Code":                      "执行代码",
+		"Render Output Plot":                "渲染输出图表",
+		"Verify And Summarize Result":       "校验并总结结果",
+		"Collect Background Context":        "收集背景信息",
+		"Synthesize Response":               "综合生成回答",
+		"Process Request":                   "处理请求",
+		"Retrieve Documentation & Best Practices for Target Frameworks": "获取目标框架文档与最佳实践",
+		"Generate Environment Setup & Integration Code for Framework A": "为框架 A 生成环境配置与集成代码",
+		"Generate Environment Setup & Integration Code for Framework B": "为框架 B 生成环境配置与集成代码",
+		"Execute A/B Tests with User Data in Sandbox":                   "在沙箱中执行 A/B 测试",
+		"Analyze Metrics & Generate Evaluation Report":                  "分析指标并生成评估报告",
+		"Parse Paper & Extract Algorithm Details":                       "解析论文并提取算法细节",
+		"Find/Clone Open Source Repository":                             "查找或克隆开源仓库",
+		"Setup Sandbox Environment (Install Dependencies)":              "搭建沙箱环境并安装依赖",
+		"Compare Results with Paper":                                    "将结果与论文进行对比",
+		"Debug/Refine Code if Results Mismatch":                         "结果不一致时调试并优化代码",
+		"Summarize Contributions":                                       "总结核心贡献",
+		"List Limitations And Risks":                                    "列出局限与风险",
+		"Compose Paper Summary":                                         "整理论文总结",
+	}
+}
+
 func validateAgentPlannedNodes(intent models.IntentContext, nodes []*models.TaskNode) error {
 	if len(nodes) == 0 {
 		return fmt.Errorf("planner agent returned no executable nodes")
@@ -750,6 +864,9 @@ func validateCriticalNodeContracts(intent models.IntentContext, nodes []*models.
 	hasPrepareRuntime := false
 	hasInstallDependencies := false
 	hasExecuteCode := false
+	hasPaperParse := false
+	hasRepoDiscovery := false
+	hasRepoPrepare := false
 
 	for _, node := range nodes {
 		if node == nil {
@@ -761,6 +878,42 @@ func validateCriticalNodeContracts(intent models.IntentContext, nodes []*models.
 			hasGeneratedCode = true
 			if node.AssignedTo != "coder_agent" {
 				return fmt.Errorf("generate_code node %q must be assigned to coder_agent", node.Name)
+			}
+		case "paper_parse":
+			hasPaperParse = true
+			if node.AssignedTo != "librarian_agent" {
+				return fmt.Errorf("paper_parse node %q must be assigned to librarian_agent", node.Name)
+			}
+			if !containsArtifact(node.OutputArtifacts, "parsed_paper") {
+				return fmt.Errorf("paper_parse node %q must output parsed_paper", node.Name)
+			}
+		case "repo_discovery":
+			hasRepoDiscovery = true
+			if node.AssignedTo != "coder_agent" {
+				return fmt.Errorf("repo_discovery node %q must be assigned to coder_agent", node.Name)
+			}
+			if !containsArtifact(node.RequiredArtifacts, "parsed_paper") {
+				return fmt.Errorf("repo_discovery node %q must require parsed_paper", node.Name)
+			}
+			if !containsArtifact(node.OutputArtifacts, "candidate_repositories") {
+				return fmt.Errorf("repo_discovery node %q must output candidate_repositories", node.Name)
+			}
+			if !containsArtifact(node.OutputArtifacts, "repo_validation_report") {
+				return fmt.Errorf("repo_discovery node %q must output repo_validation_report", node.Name)
+			}
+			if !containsArtifact(node.OutputArtifacts, "repo_url") {
+				return fmt.Errorf("repo_discovery node %q must output repo_url", node.Name)
+			}
+		case "repo_prepare":
+			hasRepoPrepare = true
+			if node.AssignedTo != "coder_agent" {
+				return fmt.Errorf("repo_prepare node %q must be assigned to coder_agent", node.Name)
+			}
+			if !containsArtifact(node.RequiredArtifacts, "repo_url") {
+				return fmt.Errorf("repo_prepare node %q must require repo_url", node.Name)
+			}
+			if !containsArtifact(node.OutputArtifacts, "generated_code") && !containsArtifact(node.OutputArtifacts, "workspace_path") {
+				return fmt.Errorf("repo_prepare node %q must output generated_code or workspace_path", node.Name)
 			}
 		case "resolve_dependencies":
 			hasResolveDependencies = true
@@ -803,6 +956,11 @@ func validateCriticalNodeContracts(intent models.IntentContext, nodes []*models.
 	if intent.IntentType == "Code_Execution" {
 		if !hasGeneratedCode || !hasResolveDependencies || !hasPrepareRuntime || !hasInstallDependencies || !hasExecuteCode {
 			return fmt.Errorf("code execution plan is missing one or more required canonical nodes")
+		}
+	}
+	if intent.IntentType == "Paper_Reproduction" {
+		if !hasPaperParse || !hasRepoDiscovery || !hasRepoPrepare || !hasResolveDependencies || !hasPrepareRuntime || !hasInstallDependencies || !hasExecuteCode {
+			return fmt.Errorf("paper reproduction plan is missing one or more required canonical nodes")
 		}
 	}
 

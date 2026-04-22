@@ -80,6 +80,25 @@ func (e *RoutedTaskExecutor) ExecuteTask(ctx context.Context, plan *models.PlanG
 		UpdatedAt: task.UpdatedAt,
 	}
 
+	// 特殊节点：repo_discovery 改为后端真实查询 Papers with Code（通过 HuggingFace Papers API），不走 LLM。
+	if task.Type == "repo_discovery" {
+		if err := executeRepoDiscovery(ctx, runtimeTask); err != nil {
+			return &models.TaskExecutionResult{
+				Status: models.StatusFailed,
+				Result: runtimeTask.Result,
+				Error:  chooseNonEmpty(runtimeTask.Error, err.Error()),
+			}, nil
+		}
+		return &models.TaskExecutionResult{
+			Status:      runtimeTask.Status,
+			Result:      runtimeTask.Result,
+			Code:        runtimeTask.Code,
+			ImageBase64: runtimeTask.ImageBase64,
+			Error:       runtimeTask.Error,
+			Artifacts:   buildArtifacts(task, runtimeTask),
+		}, nil
+	}
+
 	sharedContext := map[string]interface{}{
 		"plan_id":       plan.ID,
 		"user_intent":   plan.UserIntent,

@@ -16,15 +16,21 @@ interface TaskActions {
 interface ChatMessageListProps {
   chatHistory: ChatMessage[];
   loading: boolean;
+  isLoggedIn: boolean;
   pdfActions: PdfActions;
   taskActions: TaskActions;
 }
 
 export function ChatMessageList(props: ChatMessageListProps) {
-  const { chatHistory, loading, pdfActions, taskActions } = props;
+  const { chatHistory, loading, isLoggedIn, pdfActions, taskActions } = props;
 
   return (
     <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      {!isLoggedIn && (
+        <div className="rounded-2xl border border-dashed border-blue-200 bg-blue-50 px-4 py-3 text-sm leading-6 text-slate-600">
+          当前为游客模式：可以直接聊天和新建临时 session，但刷新页面后不会保留会话记录。
+        </div>
+      )}
       {chatHistory.map((msg, i) => (
         <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
           <div className={`max-w-[85%] flex flex-col gap-2 ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>

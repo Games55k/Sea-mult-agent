@@ -15,6 +15,7 @@ export interface ScholarRuntimeContextValue {
     handleRunAllTasks: ScholarRuntimeApi['handleRunAllTasks'];
     setDisplayMode: ScholarRuntimeApi['setDisplayMode'];
     closeTaskPanel: ScholarRuntimeApi['closeTaskPanel'];
+    resetRuntimeState: ScholarRuntimeApi['resetRuntimeState'];
   };
   meta: {
     appendSelectedTaskLog: ScholarRuntimeApi['appendSelectedTaskLog'];

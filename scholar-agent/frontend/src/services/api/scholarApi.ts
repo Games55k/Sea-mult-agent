@@ -9,13 +9,23 @@ import type {
 import { DIRECT_EXECUTION_EVENTS, PLAN_STREAM_EVENT_NAME } from '../../contracts/events';
 import { httpClient } from './httpClient';
 
-export const createPlan = async (intent: string): Promise<PlanResponse> => {
-  const response = await httpClient.post<PlanResponse>('/api/plan', { intent });
+export interface RequestIdentity {
+  userId: string;
+  sessionId: string;
+}
+
+const buildIdentityHeaders = (identity: RequestIdentity) => ({
+  'X-User-Id': identity.userId,
+  'X-Session-Id': identity.sessionId,
+});
+
+export const createPlan = async (intent: string, identity: RequestIdentity): Promise<PlanResponse> => {
+  const response = await httpClient.post<PlanResponse>('/api/plan', { intent }, { headers: buildIdentityHeaders(identity) });
   return response.data;
 };
 
-export const chat = async (message: string): Promise<ChatResponse> => {
-  const response = await httpClient.post<ChatResponse>('/api/chat', { message });
+export const chat = async (message: string, identity: RequestIdentity): Promise<ChatResponse> => {
+  const response = await httpClient.post<ChatResponse>('/api/chat', { message }, { headers: buildIdentityHeaders(identity) });
   return response.data;
 };
 
@@ -69,6 +79,7 @@ export const executeTaskStream = async (
 ): Promise<void> => {
   const response = await fetch(`${API_BASE_URL}/api/execute`, {
     method: 'POST',
+    credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });

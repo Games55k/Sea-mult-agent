@@ -1,4 +1,4 @@
-import { type ReactNode, type RefObject, useEffect, useMemo, useRef } from 'react';
+import { type ReactNode, type RefObject, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useEdgesState, useNodesState } from '@xyflow/react';
 import type { Edge, Node, OnEdgesChange, OnNodesChange } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -72,6 +72,15 @@ interface ScholarWorkspaceContentProps {
     handleSendMessage: () => void;
     intentContext: IntentContext | null;
     activePlanId: string | null;
+    isLoggedIn: boolean;
+    userId: string | null;
+    loginInput: string;
+    setLoginInput: (value: string) => void;
+    activeSessionId: string | null;
+    sessionSummaries: ReturnType<typeof useScholarChatFlow>['sessionSummaries'];
+    handleLogin: () => void;
+    handleCreateSession: () => void;
+    handleSwitchSession: (sessionId: string) => void;
   };
   pdfFlow: ReturnType<typeof usePdfAssistFlow>;
 }
@@ -108,11 +117,20 @@ function ScholarWorkspaceContent(props: ScholarWorkspaceContentProps) {
         loading: chatFlow.loading,
         prompt: chatFlow.prompt,
         showSuggestions: pdfFlow.showSuggestions,
+        isLoggedIn: chatFlow.isLoggedIn,
+        userId: chatFlow.userId,
+        loginInput: chatFlow.loginInput,
+        activeSessionId: chatFlow.activeSessionId,
+        sessions: chatFlow.sessionSummaries,
       }}
       chatActions={{
         setPrompt: chatFlow.setPrompt,
         setShowSuggestions: pdfFlow.setShowSuggestions,
         onSendMessage: chatFlow.handleSendMessage,
+        setLoginInput: chatFlow.setLoginInput,
+        onLogin: chatFlow.handleLogin,
+        onCreateSession: chatFlow.handleCreateSession,
+        onSwitchSession: chatFlow.handleSwitchSession,
       }}
       pdfActions={{
         onOpenPdf: () => pdfFlow.setPdfUrl(getPdfProxyUrl('https://arxiv.org/pdf/1706.03762.pdf')),
@@ -134,12 +152,23 @@ export default function ScholarApp() {
   const logsEndRef = useRef<HTMLDivElement>(null);
   const layout = useScholarLayoutState();
 
-  const chatFlow = useScholarChatFlow({
-    onPlanGraphGenerated: (planGraph) => {
+  const handlePlanGraphChanged = useCallback(
+    (planGraph: ReturnType<typeof useScholarChatFlow>['intentContext'] extends never ? never : Parameters<Parameters<typeof useScholarChatFlow>[0]['onPlanGraphChanged']>[0]) => {
+      if (!planGraph) {
+        setNodes([]);
+        setEdges([]);
+        return;
+      }
+
       const graphLayout = buildGraphLayout(planGraph);
       setNodes(graphLayout.nodes);
       setEdges(graphLayout.edges);
     },
+    [setEdges, setNodes],
+  );
+
+  const chatFlow = useScholarChatFlow({
+    onPlanGraphChanged: handlePlanGraphChanged,
   });
 
   const runtime = useScholarRuntime({
@@ -158,6 +187,10 @@ export default function ScholarApp() {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [runtime.selectedTaskState.logs]);
 
+  useEffect(() => {
+    runtime.resetRuntimeState();
+  }, [chatFlow.activeSessionId, runtime.resetRuntimeState]);
+
   const runtimeContextValue = useMemo<ScholarRuntimeContextValue>(
     () => ({
       state: {
@@ -171,6 +204,7 @@ export default function ScholarApp() {
         handleRunAllTasks: runtime.handleRunAllTasks,
         setDisplayMode: runtime.setDisplayMode,
         closeTaskPanel: runtime.closeTaskPanel,
+        resetRuntimeState: runtime.resetRuntimeState,
       },
       meta: {
         appendSelectedTaskLog: runtime.appendSelectedTaskLog,
@@ -196,6 +230,15 @@ export default function ScholarApp() {
           handleSendMessage: chatFlow.handleSendMessage,
           intentContext: chatFlow.intentContext,
           activePlanId: chatFlow.activePlanId,
+          isLoggedIn: chatFlow.isLoggedIn,
+          userId: chatFlow.userId,
+          loginInput: chatFlow.loginInput,
+          setLoginInput: chatFlow.setLoginInput,
+          activeSessionId: chatFlow.activeSessionId,
+          sessionSummaries: chatFlow.sessionSummaries,
+          handleLogin: chatFlow.handleLogin,
+          handleCreateSession: chatFlow.handleCreateSession,
+          handleSwitchSession: chatFlow.handleSwitchSession,
         }}
         pdfFlow={pdfFlow}
       />
