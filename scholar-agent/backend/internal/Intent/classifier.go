@@ -6,18 +6,22 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"scholar-agent-backend/internal/models"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/schema"
+	"golang.org/x/sync/errgroup"
 )
 
 // IntentClassifier 基于大模型的意图识别器
 type IntentClassifier struct {
-	enabled   bool
-	chatModel *openai.ChatModel
+	enabled     bool
+	chatModel   *openai.ChatModel
+	memoryStore MemoryStore
 }
 
 // MemoryTurn 表示一轮历史对话（记忆结构体，先模拟）
@@ -204,9 +208,14 @@ const rewriteSystemPrompt = `你是一个科研问题改写器。你的任务是
 // NewIntentClassifier 创建新的意图识别器
 func NewIntentClassifier() *IntentClassifier {
 	apiKey := os.Getenv("OPENAI_API_KEY")
+	memoryStore, memoryErr := NewRedisMemoryStoreFromEnv()
+	if memoryErr != nil {
+		log.Printf("[IntentClassifier] redis memory store init failed: %v", memoryErr)
+		memoryStore = &NoopMemoryStore{}
+	}
 	if strings.TrimSpace(apiKey) == "" {
 		log.Printf("[IntentClassifier] OPENAI_API_KEY not set, classifier disabled")
-		return &IntentClassifier{enabled: false}
+		return &IntentClassifier{enabled: false, memoryStore: memoryStore}
 	}
 
 	baseURL := os.Getenv("OPENAI_BASE_URL")
@@ -225,13 +234,14 @@ func NewIntentClassifier() *IntentClassifier {
 	})
 	if err != nil {
 		log.Printf("[IntentClassifier] init failed: %v, classifier disabled", err)
-		return &IntentClassifier{enabled: false}
+		return &IntentClassifier{enabled: false, memoryStore: memoryStore}
 	}
 
 	log.Printf("[IntentClassifier] initialized successfully with model=%s", modelName)
 	return &IntentClassifier{
-		enabled:   true,
-		chatModel: chatModel,
+		enabled:     true,
+		chatModel:   chatModel,
+		memoryStore: memoryStore,
 	}
 }
 
@@ -240,71 +250,43 @@ func (c *IntentClassifier) Enabled() bool {
 	return c != nil && c.enabled && c.chatModel != nil
 }
 
-// Classify 使用大模型对用户查询进行意图识别和实体抽取
-func (c *IntentClassifier) Classify(ctx context.Context, rawQuery string) (models.IntentContext, error) {
+// Classify 使用大模型做意图识别，并并行完成 query 重写与短期记忆注入。
+func (c *IntentClassifier) Classify(ctx context.Context, userID, sessionID, rawQuery string) (models.IntentContext, error) {
 	if !c.Enabled() {
 		return models.IntentContext{}, fmt.Errorf("intent classifier is disabled")
 	}
 
-	memory := c.mockPromptMemory(rawQuery)
-	rewrittenQuery, err := c.rewriteQuery(ctx, rawQuery, memory)
+	memory, err := c.loadPromptMemory(ctx, userID, sessionID)
 	if err != nil {
-		log.Printf("[IntentClassifier] query rewrite failed, fallback to raw query: %v", err)
-		rewrittenQuery = rawQuery
+		log.Printf("[IntentClassifier] load prompt memory failed, fallback to empty memory: %v", err)
+		memory = &PromptMemory{
+			SessionID:   sessionID,
+			RecentTurns: nil,
+			UserProfile: map[string]any{},
+			Preferences: map[string]any{},
+			TopicHints:  nil,
+		}
 	}
 
-	userPrompt := buildClassifyUserPrompt(rawQuery, rewrittenQuery, memory)
-
-	msg, err := c.chatModel.Generate(ctx, []*schema.Message{
-		{Role: schema.System, Content: systemPrompt},
-		{Role: schema.User, Content: userPrompt},
-	})
+	intentCtx, err := c.classifyAndRewriteParallel(ctx, rawQuery, memory)
 	if err != nil {
-		return models.IntentContext{}, fmt.Errorf("LLM intent classification failed: %w", err)
+		return models.IntentContext{}, err
 	}
-
-	result, err := parseLLMResponse(msg.Content)
-	if err != nil {
-		return models.IntentContext{}, fmt.Errorf("failed to parse LLM response: %w (raw: %s)", err, truncate(msg.Content, 200))
+	if intentCtx.Metadata == nil {
+		intentCtx.Metadata = map[string]any{}
 	}
-
-	// 校验 intent_type 合法性
-	if !isValidIntentType(result.IntentType) {
-		return models.IntentContext{}, fmt.Errorf("LLM returned invalid intent_type: %q", result.IntentType)
+	intentCtx.Metadata["normalized_intent"] = strings.ToLower(rawQuery)
+	intentCtx.Metadata["session_id"] = sessionID
+	intentCtx.Metadata["user_id"] = userID
+	if strings.TrimSpace(intentCtx.RewrittenIntent) != "" {
+		intentCtx.Metadata["rewritten_intent"] = intentCtx.RewrittenIntent
 	}
-
-	intentCtx := models.IntentContext{
-		RawIntent:       rawQuery,
-		RewrittenIntent: rewrittenQuery,
-		IntentType:      result.IntentType,
-		Entities:        normalizeEntities(result.Entities),
-		Constraints:     result.Constraints,
-		Confidence:      result.Confidence,
-		Reasoning:       result.Reasoning,
-		Source:          "llm",
-		Metadata: map[string]any{
-			"normalized_intent": strings.ToLower(rawQuery),
-			"rewritten_intent":  rewrittenQuery,
-		},
-	}
-
-	if intentCtx.Entities == nil {
-		intentCtx.Entities = map[string]any{}
-	}
-	if intentCtx.Constraints == nil {
-		intentCtx.Constraints = map[string]any{}
-	}
-
-	log.Printf("[IntentClassifier] query=%q intent_type=%s confidence=%.2f reasoning=%q",
-		truncate(rawQuery, 80), result.IntentType, result.Confidence, result.Reasoning)
 
 	return intentCtx, nil
 }
 
-// rewriteQuery 将用户查询重写为更专业的表达（语义保持不变）
-func (c *IntentClassifier) rewriteQuery(ctx context.Context, rawQuery string, memory *PromptMemory) (string, error) {
-
-	// 把用户 和 系统的对话历史生成一个字符串
+// Rewrite 将用户查询重写为更专业的表达（语义保持不变）。
+func (c *IntentClassifier) Rewrite(ctx context.Context, rawQuery string, memory *PromptMemory) (string, error) {
 	userPrompt := buildRewriteUserPrompt(rawQuery, memory)
 
 	msg, err := c.chatModel.Generate(ctx, []*schema.Message{
@@ -325,6 +307,182 @@ func (c *IntentClassifier) rewriteQuery(ctx context.Context, rawQuery string, me
 		return "", fmt.Errorf("rewritten_query is empty")
 	}
 	return rewritten, nil
+}
+
+// ClassifyOnly 只做分类和实体抽取，便于和 Rewrite 并行执行。
+func (c *IntentClassifier) ClassifyOnly(ctx context.Context, rawQuery string, memory *PromptMemory) (models.IntentContext, error) {
+	userPrompt := buildClassifyUserPrompt(rawQuery, "", memory)
+
+	msg, err := c.chatModel.Generate(ctx, []*schema.Message{
+		{Role: schema.System, Content: systemPrompt},
+		{Role: schema.User, Content: userPrompt},
+	})
+	if err != nil {
+		return models.IntentContext{}, fmt.Errorf("LLM intent classification failed: %w", err)
+	}
+
+	result, err := parseLLMResponse(msg.Content)
+	if err != nil {
+		return models.IntentContext{}, fmt.Errorf("failed to parse LLM response: %w (raw: %s)", err, truncate(msg.Content, 200))
+	}
+	if !isValidIntentType(result.IntentType) {
+		return models.IntentContext{}, fmt.Errorf("LLM returned invalid intent_type: %q", result.IntentType)
+	}
+
+	intentCtx := models.IntentContext{
+		RawIntent:   rawQuery,
+		IntentType:  result.IntentType,
+		Entities:    normalizeEntities(result.Entities),
+		Constraints: result.Constraints,
+		Confidence:  clampConfidence(result.Confidence),
+		Reasoning:   result.Reasoning,
+		Source:      "llm",
+	}
+	if intentCtx.Entities == nil {
+		intentCtx.Entities = map[string]any{}
+	}
+	if intentCtx.Constraints == nil {
+		intentCtx.Constraints = map[string]any{}
+	}
+	return intentCtx, nil
+}
+
+func (c *IntentClassifier) classifyAndRewriteParallel(ctx context.Context, rawQuery string, memory *PromptMemory) (models.IntentContext, error) {
+	var (
+		intentCtx      models.IntentContext
+		rewrittenQuery string
+		rewriteErr     error
+	)
+
+	g, groupCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		var err error
+		intentCtx, err = c.ClassifyOnly(groupCtx, rawQuery, memory)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		rewrittenQuery, err = c.Rewrite(groupCtx, rawQuery, memory)
+		if err != nil {
+			rewriteErr = err
+			return nil
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return models.IntentContext{}, err
+	}
+
+	if strings.TrimSpace(rewrittenQuery) == "" {
+		rewrittenQuery = rawQuery
+	}
+	intentCtx.RewrittenIntent = rewrittenQuery
+	if intentCtx.Metadata == nil {
+		intentCtx.Metadata = map[string]any{}
+	}
+	if rewriteErr != nil {
+		intentCtx.Metadata["rewrite_error"] = rewriteErr.Error()
+		log.Printf("[IntentClassifier] query rewrite failed, fallback to raw query: %v", rewriteErr)
+	}
+
+	log.Printf("[IntentClassifier] intent_type=%s confidence=%.2f source=%s",
+		intentCtx.IntentType, intentCtx.Confidence, intentCtx.Source)
+
+	return intentCtx, nil
+}
+
+func (c *IntentClassifier) loadPromptMemory(ctx context.Context, userID, sessionID string) (*PromptMemory, error) {
+	if c == nil || c.memoryStore == nil || !c.memoryStore.Enabled() || strings.TrimSpace(sessionID) == "" {
+		return &PromptMemory{
+			SessionID:   sessionID,
+			RecentTurns: nil,
+			UserProfile: map[string]any{},
+			Preferences: map[string]any{},
+			TopicHints:  nil,
+		}, nil
+	}
+
+	ttl := sessionTTLFromEnv()
+	if err := c.memoryStore.EnsureSession(ctx, userID, sessionID, ttl); err != nil {
+		return nil, err
+	}
+
+	turns, err := c.memoryStore.LoadRecentTurns(ctx, sessionID, turnsFetchFromEnv())
+	if err != nil {
+		return nil, err
+	}
+
+	recent := make([]MemoryTurn, 0, len(turns))
+	for _, turn := range turns {
+		if strings.TrimSpace(turn.Content) == "" {
+			continue
+		}
+		recent = append(recent, turn.toMemoryTurn())
+	}
+
+	return &PromptMemory{
+		SessionID:   sessionID,
+		RecentTurns: recent,
+		UserProfile: map[string]any{
+			"user_id": userID,
+		},
+		Preferences: map[string]any{},
+		TopicHints:  nil,
+	}, nil
+}
+
+func (c *IntentClassifier) persistTurnsAsync(ctx context.Context, userID, sessionID, rawQuery string, intentCtx models.IntentContext) {
+	if c == nil || c.memoryStore == nil || !c.memoryStore.Enabled() || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	go func() {
+		writeCtx, cancel := context.WithTimeout(ctx, llmTimeoutFromEnv())
+		defer cancel()
+
+		ttl := sessionTTLFromEnv()
+		maxTurns := turnsMaxFromEnv()
+		if err := c.memoryStore.EnsureSession(writeCtx, userID, sessionID, ttl); err != nil {
+			log.Printf("[IntentClassifier] ensure redis session failed: %v", err)
+			return
+		}
+		if err := c.memoryStore.AppendTurn(writeCtx, sessionID, StoredTurn{
+			Role:    "user",
+			Content: rawQuery,
+		}, maxTurns, ttl); err != nil {
+			log.Printf("[IntentClassifier] append user turn failed: %v", err)
+			return
+		}
+		if strings.TrimSpace(intentCtx.RewrittenIntent) != "" {
+			if err := c.memoryStore.AppendTurn(writeCtx, sessionID, StoredTurn{
+				Role:       "assistant",
+				Content:    intentCtx.RewrittenIntent,
+				IntentType: intentCtx.IntentType,
+				Entities:   intentCtx.Entities,
+			}, maxTurns, ttl); err != nil {
+				log.Printf("[IntentClassifier] append assistant turn failed: %v", err)
+			}
+		}
+	}()
+}
+
+// RecordTurn 用于在 chat 链路写入真实消息记录，供短期记忆复用。
+func (c *IntentClassifier) RecordTurn(ctx context.Context, userID, sessionID string, turn StoredTurn) {
+	if c == nil || c.memoryStore == nil || !c.memoryStore.Enabled() || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+
+	writeCtx, cancel := context.WithTimeout(ctx, llmTimeoutFromEnv())
+	defer cancel()
+
+	ttl := sessionTTLFromEnv()
+	if err := c.memoryStore.EnsureSession(writeCtx, userID, sessionID, ttl); err != nil {
+		log.Printf("[IntentClassifier] ensure redis session failed: %v", err)
+		return
+	}
+	if err := c.memoryStore.AppendTurn(writeCtx, sessionID, turn, turnsMaxFromEnv(), ttl); err != nil {
+		log.Printf("[IntentClassifier] append turn failed: %v", err)
+	}
 }
 
 // parseLLMResponse 解析 LLM 返回的 JSON
@@ -426,26 +584,6 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-func (c *IntentClassifier) mockPromptMemory(rawQuery string) *PromptMemory {
-	return &PromptMemory{
-		SessionID: "mock-session-id",
-		RecentTurns: []MemoryTurn{
-			{Role: "user", Content: "我最近在做 RAG 相关实验"},
-			{Role: "assistant", Content: "可以先确定框架，再定义评测指标"},
-			{Role: "user", Content: rawQuery},
-		},
-		UserProfile: map[string]any{
-			"domain": "nlp",
-			"level":  "researcher",
-		},
-		Preferences: map[string]any{
-			"language": "zh-CN",
-			"style":    "structured",
-		},
-		TopicHints: []string{"RAG", "benchmark", "query rewrite"},
-	}
-}
-
 func formatMemoryForPrompt(memory *PromptMemory) string {
 	if memory == nil {
 		return "{}"
@@ -458,12 +596,68 @@ func formatMemoryForPrompt(memory *PromptMemory) string {
 }
 
 func buildClassifyUserPrompt(rawQuery, rewrittenQuery string, memory *PromptMemory) string {
+	if strings.TrimSpace(rewrittenQuery) == "" {
+		return fmt.Sprintf(
+			"用户查询: %q\n\n上下文记忆: %s\n\n请优先依据用户原始查询进行意图识别，并参考上下文记忆提升术语一致性，按指定JSON格式输出。",
+			rawQuery,
+			formatMemoryForPrompt(memory),
+		)
+	}
 	return fmt.Sprintf(
 		"用户查询: %q\n\n专业化改写: %q\n\n上下文记忆: %s\n\n请优先依据用户原始查询进行意图识别，并参考改写查询和上下文记忆提升术语一致性，按指定JSON格式输出。",
 		rawQuery,
 		rewrittenQuery,
 		formatMemoryForPrompt(memory),
 	)
+}
+
+func clampConfidence(v float64) float64 {
+	switch {
+	case v < 0:
+		return 0
+	case v > 1:
+		return 1
+	default:
+		return v
+	}
+}
+
+func sessionTTLFromEnv() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("INTENT_SESSION_TTL")); raw != "" {
+		if ttl, err := time.ParseDuration(raw); err == nil && ttl > 0 {
+			return ttl
+		}
+	}
+	return 7 * 24 * time.Hour
+}
+
+func turnsFetchFromEnv() int {
+	return envIntWithDefault("INTENT_TURNS_FETCH", 10)
+}
+
+func turnsMaxFromEnv() int {
+	return envIntWithDefault("INTENT_TURNS_MAX", 30)
+}
+
+func llmTimeoutFromEnv() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("INTENT_LLM_TIMEOUT")); raw != "" {
+		if timeout, err := time.ParseDuration(raw); err == nil && timeout > 0 {
+			return timeout
+		}
+	}
+	return 5 * time.Second
+}
+
+func envIntWithDefault(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 func buildRewriteUserPrompt(rawQuery string, memory *PromptMemory) string {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	Intent "scholar-agent-backend/internal/Intent"
 	"scholar-agent-backend/internal/agent"
 	"scholar-agent-backend/internal/events"
 	"scholar-agent-backend/internal/models"
@@ -17,6 +18,7 @@ import (
 	"scholar-agent-backend/internal/scheduler"
 	"scholar-agent-backend/internal/store"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -193,7 +195,13 @@ type ChatPayload struct {
 // CORSMiddleware allows frontend to communicate with backend
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := c.Request.Header.Get("Origin")
+		if origin != "" {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			c.Writer.Header().Set("Vary", "Origin")
+		} else {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT")
@@ -214,6 +222,7 @@ func SetupRoutes(r *gin.Engine) {
 	p := planner.NewPlanner()
 	planStore := store.NewMemoryPlanStore()
 	eventBus := events.NewBus()
+	intentClassifier := Intent.NewIntentClassifier()
 
 	// Initialize Agents
 	sandboxURL := os.Getenv("SANDBOX_URL")
@@ -249,14 +258,32 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
+			userID := ensureAnonUserIDCookie(c)
+			sessionID := ensureSessionIDCookie(c)
+			if strings.TrimSpace(payload.Message) != "" {
+				intentClassifier.RecordTurn(c.Request.Context(), userID, sessionID, Intent.StoredTurn{
+					Role:    "user",
+					Content: payload.Message,
+				})
+			}
+
 			response, err := chatAgent.Answer(c.Request.Context(), payload.Message)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
 
+			if strings.TrimSpace(response) != "" {
+				intentClassifier.RecordTurn(c.Request.Context(), userID, sessionID, Intent.StoredTurn{
+					Role:    "assistant",
+					Content: response,
+				})
+			}
+
 			c.JSON(http.StatusOK, gin.H{
-				"response": response,
+				"response":     response,
+				"session_id":   sessionID,
+				"anon_user_id": userID,
 			})
 		})
 
@@ -316,7 +343,34 @@ func SetupRoutes(r *gin.Engine) {
 				return
 			}
 
-			intentCtx := inferIntentContextV2(payload.Intent)
+			userID := ensureAnonUserIDCookie(c)
+			sessionID := ensureSessionIDCookie(c)
+
+			intentCtx, err := inferIntentContextLLMFirst(c.Request.Context(), intentClassifier, userID, sessionID, payload.Intent)
+			if err != nil {
+				log.Printf("[Planner] intent inference failed, fallback to rule: %v", err)
+				intentCtx = inferIntentContextV2(payload.Intent)
+				intentCtx.Source = "rule_fallback"
+				if intentCtx.Metadata == nil {
+					intentCtx.Metadata = map[string]any{}
+				}
+				intentCtx.Metadata["session_id"] = sessionID
+				intentCtx.Metadata["anon_user_id"] = userID
+
+				intentClassifier.RecordTurn(c.Request.Context(), userID, sessionID, Intent.StoredTurn{
+					Role:       "user",
+					Content:    payload.Intent,
+					IntentType: intentCtx.IntentType,
+					Entities:   intentCtx.Entities,
+				})
+			} else {
+				if intentCtx.Metadata == nil {
+					intentCtx.Metadata = map[string]any{}
+				}
+				intentCtx.Metadata["session_id"] = sessionID
+				intentCtx.Metadata["anon_user_id"] = userID
+			}
+
 			logPlanRequest(payload.Intent, intentCtx)
 			intentType := intentCtx.IntentType
 
@@ -352,6 +406,8 @@ func SetupRoutes(r *gin.Engine) {
 				"message":        "Plan generated successfully",
 				"plan_graph":     planGraph,
 				"intent_context": intentCtx,
+				"session_id":     sessionID,
+				"anon_user_id":   userID,
 			}
 
 			if c.Query("include_legacy_plan") == "true" {
@@ -377,7 +433,7 @@ func SetupRoutes(r *gin.Engine) {
 			}
 
 			c.JSON(http.StatusOK, gin.H{
-				"plan":      planGraph,
+				"plan":       planGraph,
 				"plan_graph": planGraph,
 			})
 		})
@@ -637,6 +693,38 @@ func SetupRoutes(r *gin.Engine) {
 			})
 		})
 	}
+}
+
+func inferIntentContextLLMFirst(ctx context.Context, classifier *Intent.IntentClassifier, userID, sessionID, rawIntent string) (models.IntentContext, error) {
+	if classifier == nil || !classifier.Enabled() || !intentLLMEnabled() {
+		return models.IntentContext{}, fmt.Errorf("llm intent disabled")
+	}
+	llmCtx, cancel := context.WithTimeout(ctx, intentLLMTimeout())
+	defer cancel()
+	return classifier.Classify(llmCtx, userID, sessionID, rawIntent)
+}
+
+func intentLLMEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("INTENT_LLM_ENABLED"))
+	if raw == "" {
+		return true
+	}
+	return !strings.EqualFold(raw, "false")
+}
+
+func intentLLMTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("INTENT_LLM_TIMEOUT"))
+	if raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	if rawMs := strings.TrimSpace(os.Getenv("INTENT_LLM_TIMEOUT_MS")); rawMs != "" {
+		if n, err := strconv.Atoi(rawMs); err == nil && n > 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 8 * time.Second
 }
 
 func inferIntentContext(rawIntent string) models.IntentContext {
