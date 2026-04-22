@@ -260,6 +260,12 @@ func extractTitleHeuristic(text string) string {
 		if strings.HasPrefix(strings.ToLower(cleaned), "title:") {
 			return collapseSingleLine(strings.TrimSpace(cleaned[len("title:"):]))
 		}
+		// 中文报告里另一种常见格式：标题：xxx
+		if strings.HasPrefix(cleaned, "标题") {
+			if title := extractAfterTitleSeparator(cleaned); title != "" {
+				return title
+			}
+		}
 		// 中文报告里常见格式：论文标题：xxx
 		if strings.HasPrefix(cleaned, "论文标题") {
 			if title := extractAfterTitleSeparator(cleaned); title != "" {
@@ -476,12 +482,21 @@ func githubRepoScore(query string, item githubRepoItem) int {
 	desc := strings.ToLower(item.Description)
 
 	if strings.Contains(fullName, "annotated-transformer") && strings.Contains(lowerQuery, "attention is all you need") {
-		score += 50
+		score += 120
+	}
+	if strings.Contains(fullName, "harvardnlp/annotated-transformer") {
+		score += 40
 	}
 	if strings.Contains(fullName, "attention-is-all-you-need") {
 		score += 30
 	}
 	if strings.Contains(fullName, "transformer") {
+		score += 10
+	}
+	if strings.Contains(desc, "annotated implementation of the transformer paper") {
+		score += 25
+	}
+	if strings.Contains(desc, "transformer paper") {
 		score += 10
 	}
 
