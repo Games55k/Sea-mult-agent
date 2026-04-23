@@ -53,6 +53,17 @@ type llmRewriteResponse struct {
 	RewrittenQuery string `json:"rewritten_query"`
 }
 
+// llmPaperSearchResponse 是论文仓库检索字段抽取结果。
+// 这些字段用于后续 Papers with Code / GitHub 检索，避免再从长文本中二次猜测。
+type llmPaperSearchResponse struct {
+	PaperTitle  string  `json:"paper_title"`
+	ArxivID     string  `json:"paper_arxiv_id"`
+	SearchQuery string  `json:"paper_search_query"`
+	MethodName  string  `json:"paper_method_name"`
+	Confidence  float64 `json:"confidence"`
+	Reasoning   string  `json:"reasoning"`
+}
+
 const systemPrompt = `你是一个专业的科研意图识别引擎。你的任务是分析用户的自然语言查询，精确识别其科研意图类型，并提取关键实体信息。
 
 ## 意图类型定义
@@ -205,6 +216,50 @@ const rewriteSystemPrompt = `你是一个科研问题改写器。你的任务是
 输出:
 {"rewritten_query":"请说明 Query Rewrite 在 RAG 流程中的作用与价值。"}`
 
+const paperSearchSystemPrompt = `你是一个论文仓库检索字段提取器。你的任务是从用户查询中提取最适合用于 Papers with Code / GitHub 仓库搜索的结构化字段。
+
+## 目标
+输出尽量稳定、可检索的字段，供后续真实联网查询使用。
+
+## 字段定义
+- paper_title: 论文标题。只有在用户明确提到某篇论文时才填写，尽量保留原始标题大小写。
+- paper_arxiv_id: arXiv ID，例如 1706.03762。仅在用户明确给出时填写。
+- paper_search_query: 最适合直接用于检索论文或仓库的查询词。优先级通常是 arXiv ID > 论文标题 > 方法名。
+- paper_method_name: 方法名、模型名或别名，例如 Transformer、ResNet、LoRA。
+- confidence: 0~1 之间的置信度。
+- reasoning: 一句话说明提取依据。
+
+## 约束
+1. 不能编造论文标题、arXiv ID 或方法名。
+2. 如果不是论文相关请求，相关字段保持空字符串。
+3. paper_search_query 必须简洁，不能把整段任务描述原样复制进去。
+4. 若已识别到 paper_arxiv_id，paper_search_query 优先直接使用该 ID。
+5. 若已识别到 paper_title，paper_search_query 优先使用 paper_title。
+
+## 输出格式
+你必须输出严格 JSON，不要包含任何其他文本：
+{
+  "paper_title": "",
+  "paper_arxiv_id": "",
+  "paper_search_query": "",
+  "paper_method_name": "",
+  "confidence": 0.0,
+  "reasoning": ""
+}
+
+## Few-Shot 示例
+用户查询: "复现 Attention Is All You Need 这篇论文"
+输出:
+{"paper_title":"Attention Is All You Need","paper_arxiv_id":"","paper_search_query":"Attention Is All You Need","paper_method_name":"Transformer","confidence":0.96,"reasoning":"用户明确提到论文标题，且对应方法名是 Transformer"}
+
+用户查询: "帮我找一下 arXiv:1706.03762 的实现仓库"
+输出:
+{"paper_title":"","paper_arxiv_id":"1706.03762","paper_search_query":"1706.03762","paper_method_name":"","confidence":0.98,"reasoning":"用户明确给出了 arXiv ID，适合作为首选检索词"}
+
+用户查询: "解释一下 Transformer 的多头注意力"
+输出:
+{"paper_title":"","paper_arxiv_id":"","paper_search_query":"Transformer","paper_method_name":"Transformer","confidence":0.72,"reasoning":"用户只提到了方法名，没有明确指定论文标题"}`
+
 // NewIntentClassifier 创建新的意图识别器
 func NewIntentClassifier() *IntentClassifier {
 	apiKey := os.Getenv("OPENAI_API_KEY")
@@ -268,7 +323,7 @@ func (c *IntentClassifier) Classify(ctx context.Context, userID, sessionID, rawQ
 		}
 	}
 
-	intentCtx, err := c.classifyAndRewriteParallel(ctx, rawQuery, memory)
+	intentCtx, err := c.classifyRewriteAndExtractParallel(ctx, rawQuery, memory)
 	if err != nil {
 		return models.IntentContext{}, err
 	}
@@ -309,6 +364,45 @@ func (c *IntentClassifier) Rewrite(ctx context.Context, rawQuery string, memory 
 	return rewritten, nil
 }
 
+// ExtractPaperSearchFields 只负责提取论文仓库检索所需的结构化字段。
+func (c *IntentClassifier) ExtractPaperSearchFields(ctx context.Context, rawQuery string, memory *PromptMemory) (map[string]any, error) {
+	userPrompt := buildPaperSearchUserPrompt(rawQuery, memory)
+
+	msg, err := c.chatModel.Generate(ctx, []*schema.Message{
+		{Role: schema.System, Content: paperSearchSystemPrompt},
+		{Role: schema.User, Content: userPrompt},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("LLM paper search extraction failed: %w", err)
+	}
+
+	result, err := parsePaperSearchResponse(msg.Content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse paper search response: %w", err)
+	}
+
+	fields := map[string]any{}
+	if title := strings.TrimSpace(result.PaperTitle); title != "" {
+		fields["paper_title"] = title
+	}
+	if arxivID := strings.TrimSpace(result.ArxivID); arxivID != "" {
+		fields["paper_arxiv_id"] = arxivID
+	}
+	if query := strings.TrimSpace(result.SearchQuery); query != "" {
+		fields["paper_search_query"] = query
+	}
+	if method := strings.TrimSpace(result.MethodName); method != "" {
+		fields["paper_method_name"] = method
+	}
+	if result.Confidence > 0 {
+		fields["paper_search_confidence"] = clampConfidence(result.Confidence)
+	}
+	if reasoning := strings.TrimSpace(result.Reasoning); reasoning != "" {
+		fields["paper_search_reasoning"] = reasoning
+	}
+	return fields, nil
+}
+
 // ClassifyOnly 只做分类和实体抽取，便于和 Rewrite 并行执行。
 func (c *IntentClassifier) ClassifyOnly(ctx context.Context, rawQuery string, memory *PromptMemory) (models.IntentContext, error) {
 	userPrompt := buildClassifyUserPrompt(rawQuery, "", memory)
@@ -347,11 +441,13 @@ func (c *IntentClassifier) ClassifyOnly(ctx context.Context, rawQuery string, me
 	return intentCtx, nil
 }
 
-func (c *IntentClassifier) classifyAndRewriteParallel(ctx context.Context, rawQuery string, memory *PromptMemory) (models.IntentContext, error) {
+func (c *IntentClassifier) classifyRewriteAndExtractParallel(ctx context.Context, rawQuery string, memory *PromptMemory) (models.IntentContext, error) {
 	var (
 		intentCtx      models.IntentContext
 		rewrittenQuery string
 		rewriteErr     error
+		paperFields    map[string]any
+		paperFieldErr  error
 	)
 
 	g, groupCtx := errgroup.WithContext(ctx)
@@ -365,6 +461,15 @@ func (c *IntentClassifier) classifyAndRewriteParallel(ctx context.Context, rawQu
 		rewrittenQuery, err = c.Rewrite(groupCtx, rawQuery, memory)
 		if err != nil {
 			rewriteErr = err
+			return nil
+		}
+		return nil
+	})
+	g.Go(func() error {
+		var err error
+		paperFields, err = c.ExtractPaperSearchFields(groupCtx, rawQuery, memory)
+		if err != nil {
+			paperFieldErr = err
 			return nil
 		}
 		return nil
@@ -384,6 +489,14 @@ func (c *IntentClassifier) classifyAndRewriteParallel(ctx context.Context, rawQu
 	if rewriteErr != nil {
 		intentCtx.Metadata["rewrite_error"] = rewriteErr.Error()
 		log.Printf("[IntentClassifier] query rewrite failed, fallback to raw query: %v", rewriteErr)
+	}
+	if paperFieldErr != nil {
+		intentCtx.Metadata["paper_search_error"] = paperFieldErr.Error()
+		log.Printf("[IntentClassifier] paper search field extraction failed: %v", paperFieldErr)
+	}
+	if len(paperFields) > 0 {
+		mergePaperSearchFields(intentCtx.Entities, paperFields)
+		intentCtx.Metadata["paper_search_fields"] = cloneAnyMap(paperFields)
 	}
 
 	log.Printf("[IntentClassifier] intent_type=%s confidence=%.2f source=%s",
@@ -535,6 +648,26 @@ func parseRewriteResponse(raw string) (*llmRewriteResponse, error) {
 	return &result, nil
 }
 
+func parsePaperSearchResponse(raw string) (*llmPaperSearchResponse, error) {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	cleaned = strings.TrimSpace(cleaned)
+
+	if idx := strings.Index(cleaned, "{"); idx >= 0 {
+		if end := strings.LastIndex(cleaned, "}"); end > idx {
+			cleaned = cleaned[idx : end+1]
+		}
+	}
+
+	var result llmPaperSearchResponse
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		return nil, fmt.Errorf("json unmarshal failed: %w", err)
+	}
+	return &result, nil
+}
+
 // isValidIntentType 检查意图类型是否合法
 func isValidIntentType(intentType string) bool {
 	switch intentType {
@@ -574,6 +707,33 @@ func normalizeEntities(entities map[string]any) map[string]any {
 	}
 
 	return entities
+}
+
+func mergePaperSearchFields(dst map[string]any, fields map[string]any) {
+	if dst == nil || len(fields) == 0 {
+		return
+	}
+	for _, key := range []string{"paper_title", "paper_arxiv_id", "paper_search_query", "paper_method_name"} {
+		value, ok := fields[key]
+		if !ok || strings.TrimSpace(fmt.Sprint(value)) == "" {
+			continue
+		}
+		if existing, exists := dst[key]; exists && strings.TrimSpace(fmt.Sprint(existing)) != "" {
+			continue
+		}
+		dst[key] = value
+	}
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return map[string]any{}
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 // truncate 截断字符串
@@ -663,6 +823,14 @@ func envIntWithDefault(key string, fallback int) int {
 func buildRewriteUserPrompt(rawQuery string, memory *PromptMemory) string {
 	return fmt.Sprintf(
 		"用户查询: %q\n\n上下文记忆: %s\n\n请按要求输出改写结果。",
+		rawQuery,
+		formatMemoryForPrompt(memory),
+	)
+}
+
+func buildPaperSearchUserPrompt(rawQuery string, memory *PromptMemory) string {
+	return fmt.Sprintf(
+		"用户查询: %q\n\n上下文记忆: %s\n\n请提取适合论文仓库检索的结构化字段。",
 		rawQuery,
 		formatMemoryForPrompt(memory),
 	)

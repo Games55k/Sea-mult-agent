@@ -180,6 +180,14 @@ func buildTaskInputs(plan *models.PlanGraph, task *models.TaskNode) map[string]a
 		return inputs
 	}
 
+	// 先合并节点自身声明的结构化输入，供特定后端节点直接消费。
+	for key, value := range task.Inputs {
+		if value == nil {
+			continue
+		}
+		inputs[key] = value
+	}
+
 	for _, key := range task.RequiredArtifacts {
 		if artifact, ok := plan.Artifacts[key]; ok {
 			inputs[key] = artifact.Value

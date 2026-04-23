@@ -1,6 +1,6 @@
 # ScholarAgent development helpers
 
-.PHONY: all help install install-ai tidy lint build test run-backend run-frontend run-sandbox docker-up docker-down clean
+.PHONY: all help install install-ai tidy lint build package sync-frontend-dist test run-backend run-frontend run-sandbox docker-up docker-down clean
 
 all: help
 
@@ -11,6 +11,7 @@ help:
 	@echo "  make tidy          - Run go mod tidy for backend and sandbox"
 	@echo "  make lint          - Run frontend lint"
 	@echo "  make build         - Build frontend, backend and sandbox"
+	@echo "  make package       - Build a single executable with embedded frontend and sandbox"
 	@echo "  make test          - Run Go tests for backend and sandbox"
 	@echo "  make run-sandbox   - Start docker-sandbox locally via scripts/unix/"
 	@echo "  make run-backend   - Start backend locally via scripts/unix/"
@@ -36,6 +37,16 @@ build:
 	cd frontend && npm run build
 	cd backend && go build -o bin/api ./cmd/api
 	cd docker-sandbox && go build -o bin/sandbox .
+
+sync-frontend-dist:
+	rm -rf backend/webui/dist
+	mkdir -p backend/webui/dist
+	cp -R frontend/dist/. backend/webui/dist/
+
+package:
+	cd frontend && npm run build
+	$(MAKE) sync-frontend-dist
+	cd backend && go build -o bin/scholar-agent ./cmd/app
 
 test:
 	cd backend && go test ./...

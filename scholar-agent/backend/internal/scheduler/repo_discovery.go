@@ -120,10 +120,15 @@ func executeRepoDiscovery(ctx context.Context, runtimeTask *models.Task) error {
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].ScoreHint > candidates[j].ScoreHint })
-	selected = firstSelectedRepo(candidates)
+	strictTrustedSelection := arxivIDRe.FindString(query) == ""
+	if strictTrustedSelection {
+		selected = firstTrustedRepo(query, candidates)
+	} else {
+		selected = firstSelectedRepo(candidates)
+	}
 
 	candidateJSON, _ := json.Marshal(candidates)
-	report := buildRepoDiscoveryReport(query, candidates, selected, fallbackUsed)
+	report := buildRepoDiscoveryReport(query, candidates, selected, fallbackUsed, strictTrustedSelection)
 
 	if runtimeTask.Metadata == nil {
 		runtimeTask.Metadata = map[string]any{}
@@ -216,7 +221,23 @@ func hfPaperRepos(ctx context.Context, client *http.Client, base, paperID string
 }
 
 func buildRepoDiscoveryQuery(runtimeTask *models.Task) string {
-	// 1) 优先从 parsed_paper 里提取 arXiv ID 或 Title
+	// 1) 优先使用路由阶段已经提取好的结构化检索字段，避免再次从长文本里猜。
+	if runtimeTask != nil && runtimeTask.Inputs != nil {
+		if id := strings.TrimSpace(taskInputValue(runtimeTask, "paper_arxiv_id")); id != "" {
+			return id
+		}
+		if title := normalizeSearchQuery(taskInputValue(runtimeTask, "paper_title"), maxPaperSearchQueryLen); title != "" {
+			return title
+		}
+		if query := normalizeSearchQuery(taskInputValue(runtimeTask, "paper_search_query"), maxPaperSearchQueryLen); query != "" {
+			return query
+		}
+		if method := normalizeSearchQuery(taskInputValue(runtimeTask, "paper_method_name"), maxPaperSearchQueryLen); method != "" {
+			return method
+		}
+	}
+
+	// 2) 再从 parsed_paper 里提取 arXiv ID 或 Title
 	if runtimeTask != nil && runtimeTask.Inputs != nil {
 		if v, ok := runtimeTask.Inputs["parsed_paper"]; ok {
 			s := fmt.Sprint(v)
@@ -229,7 +250,7 @@ func buildRepoDiscoveryQuery(runtimeTask *models.Task) string {
 		}
 	}
 
-	// 2) 再从任务描述里提取
+	// 3) 再从任务描述里提取
 	desc := ""
 	if runtimeTask != nil {
 		desc = runtimeTask.Description
@@ -241,7 +262,7 @@ func buildRepoDiscoveryQuery(runtimeTask *models.Task) string {
 		return normalizeSearchQuery(cleanPaperTitle(title), maxPaperSearchQueryLen)
 	}
 
-	// 3) 最后退回到描述本身（做长度限制避免把整段 prompt 扔去检索）
+	// 4) 最后退回到描述本身（做长度限制避免把整段 prompt 扔去检索）
 	return normalizeSearchQuery(desc, maxPaperSearchQueryLen)
 }
 
@@ -358,7 +379,7 @@ func repoScoreHint(query, title string, repos []string) int {
 	return score
 }
 
-func buildRepoDiscoveryReport(query string, candidates []repoCandidate, selected string, fallbackUsed bool) string {
+func buildRepoDiscoveryReport(query string, candidates []repoCandidate, selected string, fallbackUsed bool, strictTrustedSelection bool) string {
 	var b strings.Builder
 	b.WriteString("仓库检索报告 / Repository Discovery Report\n")
 	b.WriteString("Query: ")
@@ -376,7 +397,11 @@ func buildRepoDiscoveryReport(query string, candidates []repoCandidate, selected
 		b.WriteString("\n")
 	} else {
 		b.WriteString("Selected repo_url: (not found)\n")
-		b.WriteString("Reason: API 返回的论文信息里未包含 GitHub 仓库链接，或检索未命中。\n")
+		if strictTrustedSelection && len(candidates) > 0 {
+			b.WriteString("Reason: 候选仓库存在，但在无 arXiv ID 场景下，没有候选通过可信仓库过滤（仓库名/描述未命中论文标题核心词）。\n")
+		} else {
+			b.WriteString("Reason: API 返回的论文信息里未包含 GitHub 仓库链接，或检索未命中。\n")
+		}
 	}
 	return b.String()
 }
@@ -388,6 +413,63 @@ func firstSelectedRepo(candidates []repoCandidate) string {
 		}
 	}
 	return ""
+}
+
+func firstTrustedRepo(query string, candidates []repoCandidate) string {
+	for _, c := range candidates {
+		if len(c.RepoURLs) == 0 {
+			continue
+		}
+		if !isTrustedRepoCandidate(query, c) {
+			continue
+		}
+		return c.RepoURLs[0]
+	}
+	return ""
+}
+
+func isTrustedRepoCandidate(query string, candidate repoCandidate) bool {
+	tokens := significantTokens(cleanPaperTitle(query))
+	if len(tokens) == 0 {
+		return false
+	}
+	text := strings.ToLower(candidateSearchText(candidate))
+	if text == "" {
+		return false
+	}
+	matched := 0
+	for _, token := range tokens {
+		if strings.Contains(text, token) {
+			matched++
+		}
+	}
+	switch {
+	case len(tokens) >= 4:
+		return matched >= 2
+	default:
+		return matched >= 1
+	}
+}
+
+func candidateSearchText(candidate repoCandidate) string {
+	parts := make([]string, 0, 4)
+	if name := strings.TrimSpace(candidate.RepoName); name != "" {
+		parts = append(parts, name)
+	}
+	if desc := strings.TrimSpace(candidate.Description); desc != "" {
+		parts = append(parts, desc)
+	}
+	for _, repoURL := range candidate.RepoURLs {
+		repoURL = strings.TrimSpace(repoURL)
+		if repoURL == "" {
+			continue
+		}
+		parts = append(parts, repoURL)
+		if parsed, err := url.Parse(repoURL); err == nil {
+			parts = append(parts, strings.Trim(parsed.Path, "/"))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func buildGitHubFallbackQueries(title string) []string {

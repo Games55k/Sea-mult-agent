@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	Intent "scholar-agent-backend/internal/Intent"
 	"scholar-agent-backend/internal/agent"
 	"scholar-agent-backend/internal/events"
@@ -25,6 +26,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+var routePaperArxivIDRe = regexp.MustCompile(`\b\d{4}\.\d{4,5}\b`)
 
 func createTaskWorkspace(taskID string) (string, error) {
 	safeTaskID := strings.Map(func(r rune) rune {
@@ -381,6 +384,7 @@ func SetupRoutes(r *gin.Engine) {
 				intentCtx.Metadata["session_id"] = sessionID
 				intentCtx.Metadata["anon_user_id"] = userID
 			}
+			enrichIntentContextWithPaperSearchFields(&intentCtx, payload.Intent)
 
 			logPlanRequest(payload.Intent, intentCtx)
 			intentType := intentCtx.IntentType
@@ -1181,4 +1185,138 @@ func extractPaperTitle(normalized string) string {
 	default:
 		return ""
 	}
+}
+
+func enrichIntentContextWithPaperSearchFields(intentCtx *models.IntentContext, rawIntent string) {
+	if intentCtx == nil {
+		return
+	}
+	if intentCtx.Entities == nil {
+		intentCtx.Entities = map[string]any{}
+	}
+	if intentCtx.Metadata == nil {
+		intentCtx.Metadata = map[string]any{}
+	}
+
+	fields := collectPaperSearchFields(*intentCtx, rawIntent)
+	if len(fields) == 0 {
+		return
+	}
+
+	for _, key := range []string{"paper_title", "paper_arxiv_id", "paper_search_query", "paper_method_name"} {
+		value, ok := fields[key]
+		if !ok || strings.TrimSpace(fmt.Sprint(value)) == "" {
+			continue
+		}
+		if existing, exists := intentCtx.Entities[key]; exists && strings.TrimSpace(fmt.Sprint(existing)) != "" {
+			continue
+		}
+		intentCtx.Entities[key] = value
+	}
+	intentCtx.Metadata["paper_search_fields"] = clonePaperSearchFields(fields)
+}
+
+func collectPaperSearchFields(intentCtx models.IntentContext, rawIntent string) map[string]any {
+	fields := map[string]any{}
+
+	// 优先复用上一步 LLM 已经抽出的结构化字段，避免重复猜测。
+	if rawFields, ok := intentCtx.Metadata["paper_search_fields"].(map[string]any); ok {
+		for key, value := range rawFields {
+			if strings.TrimSpace(fmt.Sprint(value)) != "" {
+				fields[key] = value
+			}
+		}
+	}
+	for _, key := range []string{"paper_title", "paper_arxiv_id", "paper_search_query", "paper_method_name"} {
+		if value, ok := intentCtx.Entities[key]; ok && strings.TrimSpace(fmt.Sprint(value)) != "" {
+			fields[key] = value
+		}
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(rawIntent))
+	if _, ok := fields["paper_arxiv_id"]; !ok {
+		if arxivID := routePaperArxivIDRe.FindString(rawIntent); arxivID != "" {
+			fields["paper_arxiv_id"] = arxivID
+		}
+	}
+	if _, ok := fields["paper_title"]; !ok {
+		if title := extractQuotedPaperTitle(rawIntent); title != "" {
+			fields["paper_title"] = title
+		} else if title := extractPaperTitle(normalized); title != "" {
+			fields["paper_title"] = title
+		}
+	}
+	if _, ok := fields["paper_method_name"]; !ok {
+		if method := extractPaperMethodName(normalized); method != "" {
+			fields["paper_method_name"] = method
+		}
+	}
+	if _, ok := fields["paper_search_query"]; !ok {
+		arxivID := stringFieldFromMap(fields, "paper_arxiv_id")
+		title := stringFieldFromMap(fields, "paper_title")
+		method := stringFieldFromMap(fields, "paper_method_name")
+		switch {
+		case arxivID != "":
+			fields["paper_search_query"] = arxivID
+		case title != "":
+			fields["paper_search_query"] = title
+		case method != "":
+			fields["paper_search_query"] = method
+		}
+	}
+	return fields
+}
+
+func extractQuotedPaperTitle(rawIntent string) string {
+	for _, pair := range [][2]string{
+		{"《", "》"},
+		{"\"", "\""},
+		{"'", "'"},
+	} {
+		start := strings.Index(rawIntent, pair[0])
+		end := strings.LastIndex(rawIntent, pair[1])
+		if start < 0 || end <= start {
+			continue
+		}
+		title := strings.TrimSpace(rawIntent[start+len(pair[0]) : end])
+		if title != "" && len(title) <= 240 {
+			return title
+		}
+	}
+	return ""
+}
+
+func extractPaperMethodName(normalized string) string {
+	switch {
+	case strings.Contains(normalized, "transformer"):
+		return "Transformer"
+	case strings.Contains(normalized, "resnet"):
+		return "ResNet"
+	case strings.Contains(normalized, "bert"):
+		return "BERT"
+	default:
+		return ""
+	}
+}
+
+func clonePaperSearchFields(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return map[string]any{}
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func stringFieldFromMap(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value, ok := values[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }

@@ -880,6 +880,132 @@ func mustJSON(value any) string {
 	return string(encoded)
 }
 
+var pythonStandardLibraryModules = map[string]struct{}{
+	"abc": {}, "argparse": {}, "asyncio": {}, "base64": {}, "collections": {}, "contextlib": {}, "copy": {}, "csv": {}, "dataclasses": {}, "datetime": {}, "functools": {},
+	"hashlib": {}, "io": {}, "itertools": {}, "json": {}, "logging": {}, "math": {}, "os": {}, "pathlib": {}, "random": {},
+	"re": {}, "statistics": {}, "string": {}, "subprocess": {}, "sys": {}, "tempfile": {}, "time": {}, "typing": {}, "uuid": {}, "warnings": {},
+	// 标准库：避免被误判为 PyPI 包（例如 `shutil` 不是第三方依赖，pip 永远装不上）
+	"shutil": {},
+}
+
+var pythonImportPackageMap = map[string]string{
+	"cv2":                 "opencv-python",
+	"sklearn":             "scikit-learn",
+	"PIL":                 "pillow",
+	"bs4":                 "beautifulsoup4",
+	"yaml":                "pyyaml",
+	"llama_index":         "llama-index",
+	"langchain_openai":    "langchain-openai",
+	"langchain_community": "langchain-community",
+	"faiss":               "faiss-cpu",
+}
+
+func isPythonStandardLibraryModule(name string) bool {
+	root := strings.TrimSpace(name)
+	if root == "" {
+		return false
+	}
+	root = strings.Split(root, ".")[0]
+	root = strings.Split(root, "<")[0]
+	root = strings.Split(root, ">")[0]
+	root = strings.Split(root, "=")[0]
+	root = strings.Split(root, "[")[0]
+	root = strings.ToLower(strings.TrimSpace(root))
+	_, ok := pythonStandardLibraryModules[root]
+	return ok
+}
+
+func mapPythonImportToPackage(root string) string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return ""
+	}
+	if mapped, ok := pythonImportPackageMap[root]; ok {
+		return mapped
+	}
+	if mapped, ok := pythonImportPackageMap[strings.ToLower(root)]; ok {
+		return mapped
+	}
+	return root
+}
+
+func extractMissingPythonModule(errText string) string {
+	for _, marker := range []string{"No module named '", `No module named "`} {
+		start := strings.Index(errText, marker)
+		if start < 0 {
+			continue
+		}
+		rest := errText[start+len(marker):]
+		end := strings.IndexAny(rest, `'"`)
+		if end < 0 {
+			continue
+		}
+		return strings.TrimSpace(rest[:end])
+	}
+
+	const plainMarker = "No module named "
+	start := strings.Index(errText, plainMarker)
+	if start < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(errText[start+len(plainMarker):])
+	for _, token := range strings.Fields(rest) {
+		token = strings.TrimSpace(strings.Trim(token, `"'.,:;()[]{}<>`))
+		if token != "" {
+			return token
+		}
+	}
+	return ""
+}
+
+func (a *CoderAgent) runPythonTaskInSandbox(ctx context.Context, sandboxID string, workspacePath string, codeFilePath string, code string) (*sandbox.PythonRunResponse, error) {
+	if strings.TrimSpace(workspacePath) != "" && strings.TrimSpace(codeFilePath) != "" {
+		relPath, relErr := filepath.Rel(workspacePath, codeFilePath)
+		if relErr == nil && !strings.HasPrefix(relPath, "..") {
+			cmd := []string{"bash", "-lc", buildMountedWorkspacePythonCommand(relPath)}
+			logToContext(ctx, "[%s] Executing repo entry file in mounted workspace: %s", a.Name, relPath)
+			return a.Sandbox.ExecCommandStream(ctx, sandboxID, cmd, func(stream string, line string) {
+				logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
+			})
+		}
+	}
+
+	if err := a.validatePythonSyntaxInSandbox(ctx, sandboxID, code); err != nil {
+		return nil, err
+	}
+	return a.Sandbox.RunPythonCodeStream(ctx, sandboxID, code, func(stream string, line string) {
+		logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
+	})
+}
+
+func (a *CoderAgent) installMissingPythonModule(ctx context.Context, sandboxID string, errText string) (bool, error) {
+	missingModule := extractMissingPythonModule(errText)
+	if missingModule == "" || isPythonStandardLibraryModule(missingModule) {
+		return false, nil
+	}
+
+	pkg := mapPythonImportToPackage(missingModule)
+	if pkg == "" || isPythonStandardLibraryModule(pkg) {
+		return false, nil
+	}
+
+	// 运行期兜底：依赖识别漏掉模块时，在当前 prepared_runtime 内最小补装一次。
+	logToContext(ctx, "[%s] Missing module detected at runtime: %s -> %s, retrying with pip install", a.Name, missingModule, pkg)
+	res, err := a.Sandbox.ExecCommandStream(ctx, sandboxID, []string{"python3", "-m", "pip", "install", "--default-timeout", defaultPipTimeoutSec, pkg}, func(stream string, line string) {
+		logToContext(ctx, "[%s] pip %s: %s", a.Name, stream, line)
+	})
+	if err != nil {
+		return false, err
+	}
+	if res == nil {
+		return false, fmt.Errorf("pip install returned nil response while installing %s", pkg)
+	}
+	if res.ExitCode != 0 {
+		return false, fmt.Errorf("%s", chooseNonEmpty(strings.TrimSpace(res.Stderr), strings.TrimSpace(res.Stdout), fmt.Sprintf("pip install %s exited with code %d", pkg, res.ExitCode)))
+	}
+	return true, nil
+}
+
 func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task) error {
 	workspacePath := strings.TrimSpace(extractTaskInputLike(task, "workspace_path"))
 	codeFilePath := strings.TrimSpace(extractTaskInputLike(task, "code_file_path"))
@@ -918,31 +1044,13 @@ func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task
 		defer a.Sandbox.CleanupSandbox(context.Background(), sandboxID)
 	}
 
-	var (
-		res *sandbox.PythonRunResponse
-		err error
-	)
-	if strings.TrimSpace(workspacePath) != "" && strings.TrimSpace(codeFilePath) != "" {
-		relPath, relErr := filepath.Rel(workspacePath, codeFilePath)
-		if relErr == nil && !strings.HasPrefix(relPath, "..") {
-			cmd := []string{"bash", "-lc", fmt.Sprintf("cd /workspace && python3 %s", shellEscape(relPath))}
-			logToContext(ctx, "[%s] Executing repo entry file in mounted workspace: %s", a.Name, relPath)
-			res, err = a.Sandbox.ExecCommandStream(ctx, sandboxID, cmd, func(stream string, line string) {
-				logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
-			})
-		}
-	}
-	if res == nil && err == nil {
-		if err := a.validatePythonSyntaxInSandbox(ctx, sandboxID, code); err != nil {
+	res, err := a.runPythonTaskInSandbox(ctx, sandboxID, workspacePath, codeFilePath, code)
+	if err != nil {
+		if strings.Contains(err.Error(), "python syntax validation failed") {
 			task.Status = models.StatusFailed
-			task.Error = fmt.Sprintf("python syntax validation failed: %v", err)
+			task.Error = fmt.Sprintf("sandbox execution failed: %v", err)
 			return err
 		}
-		res, err = a.Sandbox.RunPythonCodeStream(ctx, sandboxID, code, func(stream string, line string) {
-			logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
-		})
-	}
-	if err != nil {
 		task.Status = models.StatusFailed
 		task.Error = fmt.Sprintf("sandbox execution failed: %v", err)
 		return err
@@ -951,6 +1059,27 @@ func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task
 		task.Status = models.StatusFailed
 		task.Error = "sandbox execution returned nil response"
 		return fmt.Errorf("%s", task.Error)
+	}
+	if res.ExitCode != 0 {
+		errText := strings.TrimSpace(res.Stderr)
+		if errText == "" {
+			errText = fmt.Sprintf("sandbox exited with code %d", res.ExitCode)
+		}
+		if retried, installErr := a.installMissingPythonModule(ctx, sandboxID, errText); installErr == nil && retried {
+			res, err = a.runPythonTaskInSandbox(ctx, sandboxID, workspacePath, codeFilePath, code)
+			if err != nil {
+				task.Status = models.StatusFailed
+				task.Error = fmt.Sprintf("sandbox execution failed after dependency retry: %v", err)
+				return err
+			}
+			if res == nil {
+				task.Status = models.StatusFailed
+				task.Error = "sandbox execution returned nil response after dependency retry"
+				return fmt.Errorf("%s", task.Error)
+			}
+		} else if installErr != nil {
+			logToContext(ctx, "[%s] runtime missing-module recovery failed: %v", a.Name, installErr)
+		}
 	}
 	if res.ExitCode != 0 {
 		task.Status = models.StatusFailed
@@ -1181,26 +1310,6 @@ func sanitizeDependencyTokens(items []string) []string {
 }
 
 func detectPythonDependencies(code string) []string {
-	standard := map[string]struct{}{
-		"abc": {}, "argparse": {}, "asyncio": {}, "base64": {}, "collections": {}, "contextlib": {}, "copy": {}, "csv": {}, "dataclasses": {}, "datetime": {}, "functools": {},
-		"hashlib": {}, "io": {}, "itertools": {}, "json": {}, "logging": {}, "math": {}, "os": {}, "pathlib": {}, "random": {},
-		"re": {}, "statistics": {}, "string": {}, "subprocess": {}, "sys": {}, "tempfile": {}, "time": {}, "typing": {}, "uuid": {}, "warnings": {},
-		// 标准库：避免被误判为 PyPI 包（例如 `shutil` 不是第三方依赖，pip 永远装不上）
-		"shutil": {},
-	}
-
-	packageMap := map[string]string{
-		"cv2":                 "opencv-python",
-		"sklearn":             "scikit-learn",
-		"PIL":                 "pillow",
-		"bs4":                 "beautifulsoup4",
-		"yaml":                "pyyaml",
-		"llama_index":         "llama-index",
-		"langchain_openai":    "langchain-openai",
-		"langchain_community": "langchain-community",
-		"faiss":               "faiss-cpu",
-	}
-
 	deps := make([]string, 0, 8)
 	lines := strings.Split(code, "\n")
 	for _, line := range lines {
@@ -1213,14 +1322,10 @@ func detectPythonDependencies(code string) []string {
 					continue
 				}
 				root := strings.Split(name[0], ".")[0]
-				if _, ok := standard[root]; ok {
+				if isPythonStandardLibraryModule(root) {
 					continue
 				}
-				if mapped, ok := packageMap[root]; ok {
-					deps = append(deps, mapped)
-				} else {
-					deps = append(deps, root)
-				}
+				deps = append(deps, mapPythonImportToPackage(root))
 			}
 		}
 		if strings.HasPrefix(trimmed, "from ") {
@@ -1229,14 +1334,10 @@ func detectPythonDependencies(code string) []string {
 				continue
 			}
 			root := strings.Split(parts[1], ".")[0]
-			if _, ok := standard[root]; ok {
+			if isPythonStandardLibraryModule(root) {
 				continue
 			}
-			if mapped, ok := packageMap[root]; ok {
-				deps = append(deps, mapped)
-			} else {
-				deps = append(deps, root)
-			}
+			deps = append(deps, mapPythonImportToPackage(root))
 		}
 	}
 
@@ -1322,23 +1423,10 @@ func normalizeDependenciesForPython39(items []string) []string {
 }
 
 func filterStandardLibraryDependencies(items []string) []string {
-	standard := map[string]struct{}{
-		"abc": {}, "argparse": {}, "asyncio": {}, "base64": {}, "collections": {}, "contextlib": {}, "copy": {}, "csv": {}, "dataclasses": {}, "datetime": {}, "functools": {},
-		"hashlib": {}, "io": {}, "itertools": {}, "json": {}, "logging": {}, "math": {}, "os": {}, "pathlib": {}, "random": {},
-		"re": {}, "statistics": {}, "string": {}, "subprocess": {}, "sys": {}, "tempfile": {}, "time": {}, "typing": {}, "uuid": {}, "warnings": {},
-		// 标准库：避免被误判为 PyPI 包（例如 `shutil`）
-		"shutil": {},
-	}
-
 	filtered := make([]string, 0, len(items))
 	for _, item := range items {
 		name := strings.TrimSpace(strings.Trim(item, `"'`))
-		root := strings.Split(strings.ToLower(name), ".")[0]
-		root = strings.Split(root, "<")[0]
-		root = strings.Split(root, ">")[0]
-		root = strings.Split(root, "=")[0]
-		root = strings.Split(root, "[")[0]
-		if _, ok := standard[root]; ok {
+		if isPythonStandardLibraryModule(name) {
 			continue
 		}
 		filtered = append(filtered, item)
@@ -1443,6 +1531,34 @@ func shellEscape(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+func buildMountedWorkspacePythonCommand(relPath string) string {
+	entryDir := filepath.ToSlash(filepath.Dir(relPath))
+	if entryDir == "." || entryDir == "/" {
+		entryDir = ""
+	}
+
+	workspaceEntryDir := "/workspace"
+	if entryDir != "" {
+		workspaceEntryDir = "/workspace/" + strings.TrimPrefix(entryDir, "/")
+	}
+
+	// 兼容部分旧仓库：
+	// 1. 目录里有 Python 源码但没有 __init__.py
+	// 2. 与 site-packages 中的同名包（如 utils）发生导入冲突
+	// 这里在执行前最小化补齐包标记，并显式把源码目录放到 PYTHONPATH 最前面。
+	return fmt.Sprintf(
+		"cd /workspace && "+
+			"ENTRY_DIR=%s && "+
+			"find \"$ENTRY_DIR\" -type d | while read -r d; do "+
+			"if find \"$d\" -maxdepth 1 -type f -name '*.py' | grep -q . && [ ! -f \"$d/__init__.py\" ]; then : > \"$d/__init__.py\"; fi; "+
+			"done && "+
+			"PYTHONPATH=%s:/workspace:${PYTHONPATH:-} python3 %s",
+		shellEscape(workspaceEntryDir),
+		shellEscape(workspaceEntryDir),
+		shellEscape(filepath.ToSlash(relPath)),
+	)
 }
 
 func looksLikeRichTextDependencySpec(raw string) bool {

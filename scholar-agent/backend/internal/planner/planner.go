@@ -206,7 +206,7 @@ func buildPaperReproductionNodes(context string) []*models.TaskNode {
 	needsFix := hasAny(normalized, "debug", "fix", "修复", "排查", "不一致")
 
 	t1 := newNode("Parse Paper & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
-	t2 := newRepoDiscoveryNode([]string{t1.ID}, context)
+	t2 := newRepoDiscoveryNode([]string{t1.ID}, context, models.IntentContext{})
 	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url"}, []string{"workspace_path"}, false, context)
 	t4 := newNode("Setup Runtime Environment", "env_setup", "sandbox_agent", []string{t3.ID}, []string{"workspace_path"}, []string{"runtime_env"}, false, context)
 	t5 := newNode("Execute Baseline", "baseline_run", "sandbox_agent", []string{t4.ID}, []string{"runtime_env"}, []string{"run_metrics"}, false, context)
@@ -496,7 +496,7 @@ func buildPaperReproductionNodesV2(intent models.IntentContext) []*models.TaskNo
 	paperTitle := stringEntity(intent.Entities, "paper_title", "Paper")
 
 	t1 := newNode("Parse "+paperTitle+" & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
-	t2 := newRepoDiscoveryNode([]string{t1.ID}, context)
+	t2 := newRepoDiscoveryNode([]string{t1.ID}, context, intent)
 	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "repo_validation_report"}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, false, context)
 	t4 := newNode("Resolve "+paperTitle+" Dependencies", "resolve_dependencies", "coder_agent", []string{t3.ID}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, []string{"dependency_spec"}, false, context)
 	t5 := newNode("Setup Runtime Environment", "prepare_runtime", "sandbox_agent", []string{t4.ID}, []string{"workspace_path", "dependency_spec"}, []string{"runtime_session"}, false, context)
@@ -678,7 +678,7 @@ func frameworkArtifactPrefix(framework string, index int) string {
 	return normalized
 }
 
-func newRepoDiscoveryNode(deps []string, context string) *models.TaskNode {
+func newRepoDiscoveryNode(deps []string, context string, intent models.IntentContext) *models.TaskNode {
 	node := newNode(
 		"Retrieve Paper Repositories",
 		"repo_discovery",
@@ -691,7 +691,25 @@ func newRepoDiscoveryNode(deps []string, context string) *models.TaskNode {
 	)
 	// 这里用固定流程覆盖默认描述，确保仓库检索节点不再只是“让 LLM 猜一个链接”。
 	node.Description = buildRepoDiscoveryDescription(context)
+	node.Inputs = buildRepoDiscoveryInputs(intent)
 	return node
+}
+
+func buildRepoDiscoveryInputs(intent models.IntentContext) map[string]any {
+	inputs := map[string]any{}
+	if arxivID := stringEntity(intent.Entities, "paper_arxiv_id", ""); arxivID != "" {
+		inputs["paper_arxiv_id"] = arxivID
+	}
+	if title := stringEntity(intent.Entities, "paper_title", ""); title != "" {
+		inputs["paper_title"] = title
+	}
+	if query := stringEntity(intent.Entities, "paper_search_query", ""); query != "" {
+		inputs["paper_search_query"] = query
+	}
+	if method := stringEntity(intent.Entities, "paper_method_name", ""); method != "" {
+		inputs["paper_method_name"] = method
+	}
+	return inputs
 }
 
 func buildRepoDiscoveryDescription(rawIntent string) string {
