@@ -338,7 +338,12 @@ func (a *CoderAgent) ExecuteTask(ctx context.Context, task *models.Task, sharedC
 	if task != nil && task.Type == "resolve_dependencies" {
 		return a.resolveDependenciesTask(ctx, task)
 	}
-	if task != nil && task.AssignedTo == "sandbox_agent" && shouldUseDeterministicSandboxPath(task) {
+	// sandbox_agent tasks must run through the deterministic sandbox path so that:
+	// - runtime_session / prepared_runtime artifacts are produced consistently
+	// - the scheduler can wire outputs -> inputs between plan nodes
+	// Routing sandbox_agent to the Eino chain can create ephemeral sandboxes and skip
+	// artifact emission, which breaks dependency installation with "missing runtime_session".
+	if task != nil && task.AssignedTo == "sandbox_agent" {
 		return a.executeSandboxTask(ctx, task)
 	}
 	log.Printf("[%s] 开始执行任务: %s (使用 Eino 驱动)", a.Name, task.Name)
@@ -423,7 +428,8 @@ func (a *CoderAgent) prepareRuntime(ctx context.Context, task *models.Task) erro
 		return nil
 	}
 
-	sandboxID, err := a.Sandbox.CreatePersistentSandbox(ctx, task.ID, defaultSandboxImage, "")
+	mountPath := strings.TrimSpace(extractTaskInputLike(task, "workspace_path"))
+	sandboxID, err := a.Sandbox.CreatePersistentSandbox(ctx, task.ID, defaultSandboxImage, mountPath)
 	if err != nil {
 		task.Status = models.StatusFailed
 		task.Error = fmt.Sprintf("failed to create runtime sandbox: %v", err)
@@ -449,6 +455,10 @@ func (a *CoderAgent) installDependencies(ctx context.Context, task *models.Task)
 		return fmt.Errorf("%s", task.Error)
 	}
 
+	// 用于在需要时重建沙箱（例如依赖声明 Requires-Python>=3.10/3.11）
+	// 说明：mountPath 允许把 repo/workspace 挂回同一个执行环境，避免后续 execute_code 找不到代码文件。
+	mountPath := strings.TrimSpace(extractTaskInputLike(task, "workspace_path"))
+
 	rawDependencySpec := extractTaskInputLike(task, "dependency_spec")
 	dependencies, parseErr := parseDependencySpec(rawDependencySpec)
 	if parseErr != nil {
@@ -471,50 +481,197 @@ func (a *CoderAgent) installDependencies(ctx context.Context, task *models.Task)
 	}
 
 	dependencies = normalizeDependenciesForPython39(dependencies)
-	logToContext(ctx, "[%s] Installing dependencies in sandbox %s for Python 3.9: %s", a.Name, runtimeSession, strings.Join(dependencies, ", "))
-	cmd := append([]string{"python3", "-m", "pip", "install", "--default-timeout", defaultPipTimeoutSec}, dependencies...)
-	res, err := a.Sandbox.ExecCommandStream(ctx, runtimeSession, cmd, func(stream string, line string) {
-		logToContext(ctx, "[%s] pip %s: %s", a.Name, stream, line)
-	})
-	if err != nil {
+	dependencies = filterStandardLibraryDependencies(dependencies)
+
+	// 轻量 ReAct：对常见 pip 失败模式做一次自动纠正 + 重试
+	// - 标准库误判（例如 shutil）：移除后重试
+	// - Requires-Python 不匹配：自动升级到 python:3.11 沙箱后重试
+	maxAttempts := 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		logToContext(ctx, "[%s] Installing dependencies in sandbox %s (attempt %d/%d): %s", a.Name, runtimeSession, attempt, maxAttempts, strings.Join(dependencies, ", "))
+		cmd := append([]string{"python3", "-m", "pip", "install", "--default-timeout", defaultPipTimeoutSec}, dependencies...)
+		res, err := a.Sandbox.ExecCommandStream(ctx, runtimeSession, cmd, func(stream string, line string) {
+			logToContext(ctx, "[%s] pip %s: %s", a.Name, stream, line)
+		})
+		if err != nil {
+			task.Status = models.StatusFailed
+			task.Error = fmt.Sprintf("dependency installation failed: %v", err)
+			return err
+		}
+		if res == nil {
+			task.Status = models.StatusFailed
+			task.Error = "dependency installation returned nil response"
+			return fmt.Errorf("%s", task.Error)
+		}
+
+		logToContext(ctx, "[%s] pip install exit_code=%d", a.Name, res.ExitCode)
+		if res.ExitCode == 0 {
+			report := strings.TrimSpace(res.Stdout)
+			if report == "" {
+				report = "dependencies installed successfully"
+			}
+			task.Result = report
+			task.Status = models.StatusCompleted
+			if task.Metadata == nil {
+				task.Metadata = map[string]any{}
+			}
+			task.Metadata["artifact_values"] = buildArtifactValueMap(task, map[string]string{
+				"prepared_runtime":          runtimeSession,
+				"dependency_install_report": report,
+			})
+			return nil
+		}
+
+		stdout := strings.TrimSpace(res.Stdout)
+		stderr := strings.TrimSpace(res.Stderr)
+		errText := chooseNonEmpty(stderr, stdout, fmt.Sprintf("pip install exited with code %d", res.ExitCode))
+
+		// 没有下一次尝试了，直接失败返回
+		if attempt >= maxAttempts {
+			task.Status = models.StatusFailed
+			task.Result = stdout
+			task.Error = errText
+			return fmt.Errorf("%s", task.Error)
+		}
+
+		// 1) Requires-Python 不满足：升级沙箱 Python 版本后重试
+		if pipErrorIndicatesPythonVersionMismatch(errText) {
+			targetImage := choosePythonUpgradeImage(errText)
+			newSandboxID, createErr := a.Sandbox.CreatePersistentSandbox(ctx, task.ID+"-py-upgrade", targetImage, mountPath)
+			if createErr != nil {
+				task.Status = models.StatusFailed
+				task.Result = stdout
+				task.Error = fmt.Sprintf("%s; additionally failed to create upgraded sandbox %q: %v", errText, targetImage, createErr)
+				return fmt.Errorf("%s", task.Error)
+			}
+			logToContext(ctx, "[%s] Detected Requires-Python mismatch; switching sandbox %s -> %s (%s) and retrying.", a.Name, runtimeSession, newSandboxID, targetImage)
+			_ = a.Sandbox.CleanupSandbox(context.Background(), runtimeSession)
+			runtimeSession = newSandboxID
+			continue
+		}
+
+		// 2) 标准库误判：移除对应 token 后重试（双保险）
+		if missing, ok := pipErrorMissingRequirement(errText); ok {
+			// 如果 missing 是标准库模块，说明依赖识别链路还漏了一层清洗，直接删掉再试。
+			if len(filterStandardLibraryDependencies([]string{missing})) == 0 {
+				dependencies = dropDependencyByRoot(dependencies, missing)
+				logToContext(ctx, "[%s] Detected stdlib module %q in dependency list; removed and retrying.", a.Name, missing)
+				continue
+			}
+		}
+
+		// 没有命中的自动纠正规则：保留原错误直接返回，避免无限重试
 		task.Status = models.StatusFailed
-		task.Error = fmt.Sprintf("dependency installation failed: %v", err)
-		return err
-	}
-	if res == nil {
-		task.Status = models.StatusFailed
-		task.Error = "dependency installation returned nil response"
-		return fmt.Errorf("%s", task.Error)
-	}
-	logToContext(ctx, "[%s] pip install exit_code=%d", a.Name, res.ExitCode)
-	if res.ExitCode != 0 {
-		task.Status = models.StatusFailed
-		task.Result = strings.TrimSpace(res.Stdout)
-		task.Error = chooseNonEmpty(strings.TrimSpace(res.Stderr), fmt.Sprintf("pip install exited with code %d", res.ExitCode))
+		task.Result = stdout
+		task.Error = errText
 		return fmt.Errorf("%s", task.Error)
 	}
 
-	report := strings.TrimSpace(res.Stdout)
-	if report == "" {
-		report = "dependencies installed successfully"
+	// 理论上不会到达这里（for 循环内已 return）
+	task.Status = models.StatusFailed
+	task.Error = "dependency installation failed after retries"
+	return fmt.Errorf("%s", task.Error)
+}
+
+func pipErrorIndicatesPythonVersionMismatch(text string) bool {
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "requires-python") && (strings.Contains(lower, ">=3.10") || strings.Contains(lower, ">=3.11") || strings.Contains(lower, ">=3.12")) {
+		return true
 	}
-	task.Result = report
-	task.Status = models.StatusCompleted
-	if task.Metadata == nil {
-		task.Metadata = map[string]any{}
+	if strings.Contains(lower, "require a different python version") {
+		return true
 	}
-	task.Metadata["artifact_values"] = buildArtifactValueMap(task, map[string]string{
-		"prepared_runtime":          runtimeSession,
-		"dependency_install_report": report,
-	})
-	return nil
+	return false
+}
+
+func choosePythonUpgradeImage(text string) string {
+	lower := strings.ToLower(text)
+	// 优先满足更高版本要求；默认 3.11（兼容运行 3.9 代码，且能覆盖多数 Requires-Python>=3.10/3.11 的包）
+	if strings.Contains(lower, ">=3.12") {
+		return "python:3.12-bullseye"
+	}
+	if strings.Contains(lower, ">=3.11") {
+		return "python:3.11-bullseye"
+	}
+	if strings.Contains(lower, ">=3.10") {
+		return "python:3.10-bullseye"
+	}
+	return "python:3.11-bullseye"
+}
+
+func pipErrorMissingRequirement(text string) (string, bool) {
+	// 例：
+	// - "ERROR: No matching distribution found for shutil"
+	// - "ERROR: Could not find a version that satisfies the requirement X (from versions: ...)"
+	for _, prefix := range []string{
+		"no matching distribution found for ",
+		"could not find a version that satisfies the requirement ",
+	} {
+		lower := strings.ToLower(text)
+		idx := strings.Index(lower, prefix)
+		if idx < 0 {
+			continue
+		}
+		raw := strings.TrimSpace(text[idx+len(prefix):])
+		if raw == "" {
+			continue
+		}
+		// 截断到空格/括号前，拿到包名 root
+		raw = strings.TrimPrefix(raw, ":")
+		raw = strings.TrimSpace(raw)
+		for _, sep := range []string{" ", "(", ";", ","} {
+			if cut := strings.Index(raw, sep); cut >= 0 {
+				raw = raw[:cut]
+			}
+		}
+		raw = strings.TrimSpace(strings.Trim(raw, `"'`))
+		if raw == "" {
+			continue
+		}
+		root := strings.Split(raw, "[")[0]
+		root = strings.Split(root, "<")[0]
+		root = strings.Split(root, ">")[0]
+		root = strings.Split(root, "=")[0]
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		return root, true
+	}
+	return "", false
+}
+
+func dropDependencyByRoot(items []string, root string) []string {
+	root = strings.ToLower(strings.TrimSpace(root))
+	if root == "" {
+		return items
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		name := strings.ToLower(strings.TrimSpace(item))
+		if name == "" {
+			continue
+		}
+		normalizedRoot := strings.Split(name, "[")[0]
+		normalizedRoot = strings.Split(normalizedRoot, "<")[0]
+		normalizedRoot = strings.Split(normalizedRoot, ">")[0]
+		normalizedRoot = strings.Split(normalizedRoot, "=")[0]
+		normalizedRoot = strings.TrimSpace(normalizedRoot)
+		if normalizedRoot == root {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task) error {
+	workspacePath := strings.TrimSpace(extractTaskInputLike(task, "workspace_path"))
+	codeFilePath := strings.TrimSpace(extractTaskInputLike(task, "code_file_path"))
 	code := extractTaskInputLike(task, "generated_code")
-	if strings.TrimSpace(code) == "" {
+	if strings.TrimSpace(code) == "" && strings.TrimSpace(codeFilePath) == "" {
 		task.Status = models.StatusFailed
-		task.Error = "missing generated_code input for sandbox execution"
+		task.Error = "missing generated_code/code_file_path input for sandbox execution"
 		return fmt.Errorf("%s", task.Error)
 	}
 
@@ -546,15 +703,30 @@ func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task
 		defer a.Sandbox.CleanupSandbox(context.Background(), sandboxID)
 	}
 
-	if err := a.validatePythonSyntaxInSandbox(ctx, sandboxID, code); err != nil {
-		task.Status = models.StatusFailed
-		task.Error = fmt.Sprintf("python syntax validation failed: %v", err)
-		return err
+	var (
+		res *sandbox.PythonRunResponse
+		err error
+	)
+	if strings.TrimSpace(workspacePath) != "" && strings.TrimSpace(codeFilePath) != "" {
+		relPath, relErr := filepath.Rel(workspacePath, codeFilePath)
+		if relErr == nil && !strings.HasPrefix(relPath, "..") {
+			cmd := []string{"bash", "-lc", fmt.Sprintf("cd /workspace && python3 %s", shellEscape(relPath))}
+			logToContext(ctx, "[%s] Executing repo entry file in mounted workspace: %s", a.Name, relPath)
+			res, err = a.Sandbox.ExecCommandStream(ctx, sandboxID, cmd, func(stream string, line string) {
+				logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
+			})
+		}
 	}
-
-	res, err := a.Sandbox.RunPythonCodeStream(ctx, sandboxID, code, func(stream string, line string) {
-		logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
-	})
+	if res == nil && err == nil {
+		if err := a.validatePythonSyntaxInSandbox(ctx, sandboxID, code); err != nil {
+			task.Status = models.StatusFailed
+			task.Error = fmt.Sprintf("python syntax validation failed: %v", err)
+			return err
+		}
+		res, err = a.Sandbox.RunPythonCodeStream(ctx, sandboxID, code, func(stream string, line string) {
+			logToContext(ctx, "[%s] python %s: %s", a.Name, stream, line)
+		})
+	}
 	if err != nil {
 		task.Status = models.StatusFailed
 		task.Error = fmt.Sprintf("sandbox execution failed: %v", err)
@@ -593,17 +765,24 @@ func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task
 }
 
 func (a *CoderAgent) resolveDependenciesTask(ctx context.Context, task *models.Task) error {
+	workspacePath := strings.TrimSpace(extractTaskInputLike(task, "workspace_path"))
+	codeFilePath := strings.TrimSpace(extractTaskInputLike(task, "code_file_path"))
 	code := extractTaskInputLike(task, "generated_code")
+	if strings.TrimSpace(code) == "" && strings.TrimSpace(codeFilePath) != "" {
+		if raw, err := os.ReadFile(codeFilePath); err == nil {
+			code = string(raw)
+		}
+	}
 	if strings.TrimSpace(code) == "" {
 		code = task.Code
 	}
-	if strings.TrimSpace(code) == "" {
-		task.Status = models.StatusFailed
-		task.Error = "missing generated_code input for dependency resolution"
-		return fmt.Errorf("%s", task.Error)
-	}
 
-	dependencies := normalizeDependenciesForPython39(detectPythonDependencies(code))
+	dependencies := make([]string, 0, 16)
+	if strings.TrimSpace(workspacePath) != "" {
+		dependencies = append(dependencies, detectRepositoryDependencies(workspacePath)...)
+	}
+	dependencies = append(dependencies, detectPythonDependencies(code)...)
+	dependencies = normalizeDependenciesForPython39(uniqueDependencies(dependencies))
 	payload, err := json.Marshal(dependencies)
 	if err != nil {
 		task.Status = models.StatusFailed
@@ -717,7 +896,13 @@ func parseDependencySpec(raw string) ([]string, error) {
 
 	var deps []string
 	if err := json.Unmarshal([]byte(raw), &deps); err == nil {
-		return uniqueDependencies(deps), nil
+		cleaned := sanitizeDependencyTokens(deps)
+		for _, item := range cleaned {
+			if !isValidDependencyToken(item) {
+				return nil, fmt.Errorf("invalid dependency token %q", item)
+			}
+		}
+		return uniqueDependencies(cleaned), nil
 	}
 
 	if looksLikeRichTextDependencySpec(raw) {
@@ -725,7 +910,7 @@ func parseDependencySpec(raw string) ([]string, error) {
 	}
 
 	parts := strings.Split(raw, ",")
-	cleaned := uniqueDependencies(parts)
+	cleaned := sanitizeDependencyTokens(parts)
 	if len(cleaned) == 0 {
 		return nil, nil
 	}
@@ -734,7 +919,50 @@ func parseDependencySpec(raw string) ([]string, error) {
 			return nil, fmt.Errorf("invalid dependency token %q", item)
 		}
 	}
-	return cleaned, nil
+	return uniqueDependencies(cleaned), nil
+}
+
+// sanitizeDependencyTokens normalizes dependency_spec into a pip-friendly argv list.
+//
+// Why:
+// - LLM outputs sometimes include Markdown backticks or trailing commas.
+// - Some entries may embed multiple argv parts, e.g. "--find-links https://...".
+// This function keeps things simple and safe: it strips obvious formatting noise and
+// splits on whitespace (no shell involved; we pass argv directly).
+func sanitizeDependencyTokens(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, raw := range items {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+
+		// Remove Markdown/code formatting and common punctuation noise.
+		item = strings.Trim(item, `"'`)
+		item = strings.ReplaceAll(item, "`", "")
+		item = strings.TrimSpace(item)
+
+		// Some outputs append commas to tokens (or even to URLs within backticks).
+		item = strings.TrimRight(item, ",")
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+
+		// If a single list entry contains multiple argv parts (e.g. pip options),
+		// split them so pip gets correct arguments.
+		for _, part := range strings.Fields(item) {
+			part = strings.TrimSpace(strings.Trim(part, `"'`))
+			part = strings.ReplaceAll(part, "`", "")
+			part = strings.TrimRight(part, ",")
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func detectPythonDependencies(code string) []string {
@@ -742,6 +970,8 @@ func detectPythonDependencies(code string) []string {
 		"abc": {}, "argparse": {}, "asyncio": {}, "base64": {}, "collections": {}, "contextlib": {}, "copy": {}, "csv": {}, "dataclasses": {}, "datetime": {}, "functools": {},
 		"hashlib": {}, "io": {}, "itertools": {}, "json": {}, "logging": {}, "math": {}, "os": {}, "pathlib": {}, "random": {},
 		"re": {}, "statistics": {}, "string": {}, "subprocess": {}, "sys": {}, "tempfile": {}, "time": {}, "typing": {}, "uuid": {}, "warnings": {},
+		// 标准库：避免被误判为 PyPI 包（例如 `shutil` 不是第三方依赖，pip 永远装不上）
+		"shutil": {},
 	}
 
 	packageMap := map[string]string{
@@ -830,15 +1060,48 @@ func normalizeDependenciesForPython39(items []string) []string {
 		normalized = append(normalized, value)
 	}
 
+	// Some packages have optional submodules split into extra distributions.
+	// Example: newer langchain code paths may import langchain_community at runtime.
+	// We add a minimal compatibility shim: if langchain is requested, ensure
+	// langchain-community is present to avoid ModuleNotFoundError during execution.
+	hasLangchain := false
+	hasLangchainCommunity := false
+	for _, item := range items {
+		name := strings.ToLower(strings.TrimSpace(item))
+		if name == "" {
+			continue
+		}
+		// Normalize to root package name for detection (strip version/extras).
+		root := strings.Split(name, "[")[0]
+		root = strings.Split(root, "<")[0]
+		root = strings.Split(root, ">")[0]
+		root = strings.Split(root, "=")[0]
+		root = strings.TrimSpace(root)
+		switch root {
+		case "langchain":
+			hasLangchain = true
+		case "langchain-community":
+			hasLangchainCommunity = true
+		}
+	}
+
 	for _, item := range filterStandardLibraryDependencies(items) {
 		name := strings.TrimSpace(item)
 		switch strings.ToLower(name) {
+		case "oscar==2.2.1":
+			// 最小纠错：PyPI 上 `oscar` 没有 2.2.1（常见误写，实际多为 `django-oscar`）。
+			// 仅对这个已观测到的失败版本做替换，避免误伤其它同名包的合法用法。
+			appendOnce("django-oscar==2.2.1")
 		case "llama-index":
 			appendOnce("llama-index<0.12")
 			appendOnce("pydantic<2.10")
 		default:
 			appendOnce(name)
 		}
+	}
+
+	if hasLangchain && !hasLangchainCommunity {
+		appendOnce("langchain-community")
 	}
 	return normalized
 }
@@ -848,6 +1111,8 @@ func filterStandardLibraryDependencies(items []string) []string {
 		"abc": {}, "argparse": {}, "asyncio": {}, "base64": {}, "collections": {}, "contextlib": {}, "copy": {}, "csv": {}, "dataclasses": {}, "datetime": {}, "functools": {},
 		"hashlib": {}, "io": {}, "itertools": {}, "json": {}, "logging": {}, "math": {}, "os": {}, "pathlib": {}, "random": {},
 		"re": {}, "statistics": {}, "string": {}, "subprocess": {}, "sys": {}, "tempfile": {}, "time": {}, "typing": {}, "uuid": {}, "warnings": {},
+		// 标准库：避免被误判为 PyPI 包（例如 `shutil`）
+		"shutil": {},
 	}
 
 	filtered := make([]string, 0, len(items))
@@ -926,6 +1191,45 @@ func buildArtifactValueMap(task *models.Task, base map[string]string) map[string
 	return out
 }
 
+func detectRepositoryDependencies(workspacePath string) []string {
+	candidates := []string{
+		filepath.Join(workspacePath, "requirements.txt"),
+		filepath.Join(workspacePath, "environment.yml"),
+		filepath.Join(workspacePath, "environment.yaml"),
+		filepath.Join(workspacePath, "setup.py"),
+		filepath.Join(workspacePath, "pyproject.toml"),
+	}
+
+	deps := make([]string, 0, 16)
+	for _, candidate := range candidates {
+		raw, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		text := string(raw)
+		switch filepath.Base(candidate) {
+		case "requirements.txt":
+			for _, line := range strings.Split(text, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				deps = append(deps, line)
+			}
+		default:
+			deps = append(deps, detectPythonDependencies(text)...)
+		}
+	}
+	return uniqueDependencies(deps)
+}
+
+func shellEscape(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
 func looksLikeRichTextDependencySpec(raw string) bool {
 	normalized := strings.ToLower(raw)
 	markers := []string{
@@ -952,12 +1256,19 @@ func isValidDependencyToken(value string) bool {
 	if value == "" {
 		return false
 	}
+	// pip argv is passed without a shell, but we still forbid whitespace and quoting chars
+	// to avoid accidental token merging or Markdown artifacts.
+	if strings.ContainsAny(value, " \t\r\n`\"'") {
+		return false
+	}
 	for _, r := range value {
 		switch {
 		case r >= 'a' && r <= 'z':
 		case r >= 'A' && r <= 'Z':
 		case r >= '0' && r <= '9':
-		case strings.ContainsRune("._-<>!=[]", r):
+		// Allow common requirement spec chars and URL chars used by pip options.
+		case strings.ContainsRune("._-<>!=[]:+/@%?&=#~", r):
+		case r == '+':
 		default:
 			return false
 		}

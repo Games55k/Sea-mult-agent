@@ -391,7 +391,7 @@ func applyPlannerNodeDefaults(bp plannerNodeBlueprint) plannerNodeBlueprint {
 		}
 	case "repo_prepare":
 		bp.RequiredArtifacts = ensureArtifacts(bp.RequiredArtifacts, "repo_url")
-		bp.OutputArtifacts = ensureArtifacts(bp.OutputArtifacts, "generated_code")
+		bp.OutputArtifacts = ensureArtifacts(bp.OutputArtifacts, "workspace_path", "code_file_path", "generated_code", "repo_manifest")
 	}
 	return bp
 }

@@ -181,11 +181,18 @@ type RequestPayload struct {
 }
 
 type ExecutePayload struct {
-	TaskID          string `json:"task_id"`
-	TaskName        string `json:"task_name"`
-	TaskType        string `json:"task_type"`
-	TaskDescription string `json:"task_description" binding:"required"`
+	TaskID   string `json:"task_id"`
+	TaskName string `json:"task_name"`
+	TaskType string `json:"task_type"`
+	// task_description is optional for plan-aware execution because the node description
+	// is derived from the stored plan graph.
+	TaskDescription string `json:"task_description"`
 	AssignedTo      string `json:"assigned_to"`
+	// Optional: when provided, /api/execute will execute a node within an existing plan graph,
+	// hydrating upstream artifacts (e.g. runtime_session) and persisting this node's outputs back
+	// into planStore so subsequent nodes can resume from snapshots.
+	PlanID string `json:"plan_id"`
+	NodeID string `json:"node_id"`
 }
 
 type ChatPayload struct {
@@ -548,6 +555,161 @@ func SetupRoutes(r *gin.Engine) {
 
 			// Create a context with the log channel
 			ctx := context.WithValue(c.Request.Context(), "logChannel", logChannel)
+
+			// Plan-aware single node execution (breakpoint/resume):
+			// - hydrate required artifacts from planStore
+			// - execute the node via the same executor used by the scheduler
+			// - persist node outputs (artifacts) back to planStore as a "node snapshot"
+			if strings.TrimSpace(payload.PlanID) != "" {
+				planID := strings.TrimSpace(payload.PlanID)
+				nodeID := strings.TrimSpace(payload.NodeID)
+				if nodeID == "" {
+					nodeID = strings.TrimSpace(payload.TaskID)
+				}
+				if nodeID == "" {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "missing node_id/task_id for plan execution"})
+					return
+				}
+				planGraph, err := planStore.GetPlan(planID)
+				if err != nil || planGraph == nil {
+					c.JSON(http.StatusNotFound, gin.H{"error": "plan not found"})
+					return
+				}
+				var node *models.TaskNode
+				for _, n := range planGraph.Nodes {
+					if n != nil && n.ID == nodeID {
+						node = n
+						break
+					}
+				}
+				if node == nil {
+					c.JSON(http.StatusNotFound, gin.H{"error": "plan node not found"})
+					return
+				}
+
+				// Emit a lightweight started event (helps frontend correlate resume runs).
+				_ = planStore.AppendEvent(planID, models.PlanEvent{
+					PlanID:     planID,
+					EventType:  "task_started",
+					TaskID:     node.ID,
+					TaskStatus: string(models.StatusInProgress),
+					Timestamp:  time.Now(),
+				})
+
+				go func() {
+					// Execute using the same plan/task wiring logic as the scheduler.
+					result, execErr := graphExecutor.ExecuteTask(ctx, planGraph, node)
+					if execErr != nil {
+						result = &models.TaskExecutionResult{
+							Status: models.StatusFailed,
+							Error:  execErr.Error(),
+						}
+					}
+					if result == nil {
+						result = &models.TaskExecutionResult{
+							Status: models.StatusFailed,
+							Error:  "task execution returned nil result",
+						}
+					}
+
+					// Persist a "node snapshot" back into the plan so downstream nodes can resume.
+					_ = planStore.UpdatePlan(planID, func(p *models.PlanGraph) error {
+						if p == nil {
+							return fmt.Errorf("plan is nil")
+						}
+						var current *models.TaskNode
+						for _, n := range p.Nodes {
+							if n != nil && n.ID == nodeID {
+								current = n
+								break
+							}
+						}
+						if current == nil {
+							return fmt.Errorf("task not found: %s", nodeID)
+						}
+						now := time.Now()
+						current.UpdatedAt = now
+						current.RunCount++
+						current.Result = result.Result
+						current.Code = result.Code
+						current.ImageBase64 = result.ImageBase64
+						if result.Status == models.StatusFailed {
+							current.Status = models.StatusFailed
+							current.Error = result.Error
+						} else {
+							current.Status = models.StatusCompleted
+							current.Error = ""
+							current.FinishedAt = &now
+							for _, artifact := range result.Artifacts {
+								p.Artifacts[artifact.Key] = artifact
+							}
+						}
+						// Minimal meta refresh (same as scheduler.fillMeta)
+						meta := models.GraphMeta{TotalNodes: len(p.Nodes)}
+						for _, n := range p.Nodes {
+							if n == nil {
+								continue
+							}
+							switch n.Status {
+							case models.StatusCompleted:
+								meta.CompletedNodes++
+							case models.StatusFailed:
+								meta.FailedNodes++
+							case models.StatusBlocked:
+								meta.BlockedNodes++
+							case models.StatusInProgress:
+								meta.InProgressNodes++
+							case models.StatusReady:
+								meta.ReadyNodes++
+							}
+						}
+						p.Meta = meta
+						return nil
+					})
+
+					if result.Status == models.StatusFailed {
+						msg := strings.TrimSpace(result.Error)
+						if msg == "" {
+							msg = "task failed"
+						}
+						done <- fmt.Errorf("%s", msg)
+						return
+					}
+					done <- nil
+				}()
+
+				// Stream logs/results to frontend (same shape as direct execution).
+				c.Stream(func(w io.Writer) bool {
+					ticker := time.NewTicker(5 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case logMsg := <-logChannel:
+							c.SSEvent("log", logMsg)
+							return true
+						case <-ticker.C:
+							c.SSEvent("heartbeat", "keep-alive")
+							return true
+						case err := <-done:
+							for len(logChannel) > 0 {
+								c.SSEvent("log", <-logChannel)
+							}
+							if err != nil {
+								c.SSEvent("error", err.Error())
+							} else {
+								// Provide a minimal result payload; detailed results remain in planStore snapshots.
+								c.SSEvent("result", gin.H{
+									"result": "ok",
+								})
+							}
+							return false
+						case <-c.Request.Context().Done():
+							return false
+						}
+					}
+				})
+				return
+			}
 
 			// Create a mock task to pass to the agent
 			task := &models.Task{

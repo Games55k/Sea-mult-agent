@@ -98,6 +98,23 @@ func (e *RoutedTaskExecutor) ExecuteTask(ctx context.Context, plan *models.PlanG
 			Artifacts:   buildArtifacts(task, runtimeTask),
 		}, nil
 	}
+	if task.Type == "repo_prepare" {
+		if err := executeRepoPrepare(ctx, runtimeTask); err != nil {
+			return &models.TaskExecutionResult{
+				Status: models.StatusFailed,
+				Result: runtimeTask.Result,
+				Error:  chooseNonEmpty(runtimeTask.Error, err.Error()),
+			}, nil
+		}
+		return &models.TaskExecutionResult{
+			Status:      runtimeTask.Status,
+			Result:      runtimeTask.Result,
+			Code:        runtimeTask.Code,
+			ImageBase64: runtimeTask.ImageBase64,
+			Error:       runtimeTask.Error,
+			Artifacts:   buildArtifacts(task, runtimeTask),
+		}, nil
+	}
 
 	sharedContext := map[string]interface{}{
 		"plan_id":       plan.ID,

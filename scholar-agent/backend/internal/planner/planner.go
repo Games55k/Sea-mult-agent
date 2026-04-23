@@ -497,11 +497,11 @@ func buildPaperReproductionNodesV2(intent models.IntentContext) []*models.TaskNo
 
 	t1 := newNode("Parse "+paperTitle+" & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
 	t2 := newRepoDiscoveryNode([]string{t1.ID}, context)
-	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "repo_validation_report"}, []string{"generated_code"}, false, context)
-	t4 := newNode("Resolve "+paperTitle+" Dependencies", "resolve_dependencies", "coder_agent", []string{t3.ID}, []string{"generated_code"}, []string{"dependency_spec"}, false, context)
-	t5 := newNode("Setup Runtime Environment", "prepare_runtime", "sandbox_agent", []string{t4.ID}, []string{"dependency_spec"}, []string{"runtime_session"}, false, context)
+	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "repo_validation_report"}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, false, context)
+	t4 := newNode("Resolve "+paperTitle+" Dependencies", "resolve_dependencies", "coder_agent", []string{t3.ID}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, []string{"dependency_spec"}, false, context)
+	t5 := newNode("Setup Runtime Environment", "prepare_runtime", "sandbox_agent", []string{t4.ID}, []string{"workspace_path", "dependency_spec"}, []string{"runtime_session"}, false, context)
 	t6 := newNode("Install "+paperTitle+" Dependencies", "install_dependencies", "sandbox_agent", []string{t5.ID}, []string{"runtime_session", "dependency_spec"}, []string{"prepared_runtime", "dependency_install_report"}, false, context)
-	t7 := newNode("Execute Baseline", "execute_code", "sandbox_agent", []string{t6.ID}, []string{"generated_code", "prepared_runtime"}, []string{"run_metrics"}, false, context)
+	t7 := newNode("Execute Baseline", "execute_code", "sandbox_agent", []string{t6.ID}, []string{"workspace_path", "code_file_path", "generated_code", "prepared_runtime"}, []string{"run_metrics"}, false, context)
 	t8 := newNode("Compare With Paper Claims", "paper_compare", "data_agent", []string{t7.ID}, []string{"run_metrics", "parsed_paper"}, []string{"comparison_report"}, false, context)
 
 	nodes := []*models.TaskNode{t1, t2, t3, t4, t5, t6, t7, t8}
