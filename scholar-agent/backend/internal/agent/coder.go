@@ -46,6 +46,7 @@ type CoderAgent struct {
 	Name          string
 	SystemPrompt  string
 	Sandbox       *sandbox.SandboxClient
+	ChatModel     *openai.ChatModel
 	CodeOnlyChain compose.Runnable[string, string]
 	EinoChain     compose.Runnable[string, string] // 使用 Eino 编排的执行链
 }
@@ -116,6 +117,7 @@ func (a *CoderAgent) initRealEinoChain() {
 	if err != nil {
 		log.Fatalf("初始化大模型失败: %v", err)
 	}
+	a.ChatModel = chatModel
 
 	// 2. 构建 Eino Graph
 	codeOnlyGraph := compose.NewGraph[string, string]()
@@ -483,10 +485,9 @@ func (a *CoderAgent) installDependencies(ctx context.Context, task *models.Task)
 	dependencies = normalizeDependenciesForPython39(dependencies)
 	dependencies = filterStandardLibraryDependencies(dependencies)
 
-	// 轻量 ReAct：对常见 pip 失败模式做一次自动纠正 + 重试
-	// - 标准库误判（例如 shutil）：移除后重试
-	// - Requires-Python 不匹配：自动升级到 python:3.11 沙箱后重试
-	maxAttempts := 2
+	// ReAct 依赖恢复：优先让模型根据 pip 日志给出结构化动作，
+	// 再由规则兜底，避免把“重试”做成纯盲试。
+	maxAttempts := 3
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		logToContext(ctx, "[%s] Installing dependencies in sandbox %s (attempt %d/%d): %s", a.Name, runtimeSession, attempt, maxAttempts, strings.Join(dependencies, ", "))
 		cmd := append([]string{"python3", "-m", "pip", "install", "--default-timeout", defaultPipTimeoutSec}, dependencies...)
@@ -534,30 +535,35 @@ func (a *CoderAgent) installDependencies(ctx context.Context, task *models.Task)
 			return fmt.Errorf("%s", task.Error)
 		}
 
-		// 1) Requires-Python 不满足：升级沙箱 Python 版本后重试
-		if pipErrorIndicatesPythonVersionMismatch(errText) {
-			targetImage := choosePythonUpgradeImage(errText)
-			newSandboxID, createErr := a.Sandbox.CreatePersistentSandbox(ctx, task.ID+"-py-upgrade", targetImage, mountPath)
-			if createErr != nil {
-				task.Status = models.StatusFailed
-				task.Result = stdout
-				task.Error = fmt.Sprintf("%s; additionally failed to create upgraded sandbox %q: %v", errText, targetImage, createErr)
-				return fmt.Errorf("%s", task.Error)
-			}
-			logToContext(ctx, "[%s] Detected Requires-Python mismatch; switching sandbox %s -> %s (%s) and retrying.", a.Name, runtimeSession, newSandboxID, targetImage)
-			_ = a.Sandbox.CleanupSandbox(context.Background(), runtimeSession)
-			runtimeSession = newSandboxID
-			continue
-		}
-
-		// 2) 标准库误判：移除对应 token 后重试（双保险）
-		if missing, ok := pipErrorMissingRequirement(errText); ok {
-			// 如果 missing 是标准库模块，说明依赖识别链路还漏了一层清洗，直接删掉再试。
-			if len(filterStandardLibraryDependencies([]string{missing})) == 0 {
-				dependencies = dropDependencyByRoot(dependencies, missing)
-				logToContext(ctx, "[%s] Detected stdlib module %q in dependency list; removed and retrying.", a.Name, missing)
+		// 第一优先级：模型基于 pip 错误做一次结构化 ReAct 决策。
+		if plan, reactErr := a.planDependencyRecovery(ctx, dependencies, errText); reactErr == nil && plan.Action != "" {
+			nextDependencies, nextRuntimeSession, changed, applyErr := a.applyDependencyRecoveryPlan(ctx, task, dependencies, runtimeSession, mountPath, plan)
+			if applyErr == nil && changed {
+				dependencies = nextDependencies
+				runtimeSession = nextRuntimeSession
+				logToContext(ctx, "[%s] ReAct repair applied: action=%s, reason=%s", a.Name, plan.Action, plan.Reason)
 				continue
 			}
+			if applyErr != nil {
+				logToContext(ctx, "[%s] ReAct repair plan apply failed, fallback to rules: %v", a.Name, applyErr)
+			} else {
+				logToContext(ctx, "[%s] ReAct repair returned no effective change, fallback to rules.", a.Name)
+			}
+		}
+
+		// 第二优先级：规则兜底，覆盖已知稳定场景。
+		nextDependencies, nextRuntimeSession, changed, fallbackReason, fallbackErr := a.applyRuleBasedDependencyFallback(ctx, task, dependencies, runtimeSession, mountPath, errText)
+		if fallbackErr != nil {
+			task.Status = models.StatusFailed
+			task.Result = stdout
+			task.Error = fallbackErr.Error()
+			return fallbackErr
+		}
+		if changed {
+			dependencies = nextDependencies
+			runtimeSession = nextRuntimeSession
+			logToContext(ctx, "[%s] Rule-based dependency fallback applied: %s", a.Name, fallbackReason)
+			continue
 		}
 
 		// 没有命中的自动纠正规则：保留原错误直接返回，避免无限重试
@@ -571,6 +577,156 @@ func (a *CoderAgent) installDependencies(ctx context.Context, task *models.Task)
 	task.Status = models.StatusFailed
 	task.Error = "dependency installation failed after retries"
 	return fmt.Errorf("%s", task.Error)
+}
+
+type dependencyRecoveryPlan struct {
+	Action           string   `json:"action"`
+	Reason           string   `json:"reason"`
+	RemovePackage    string   `json:"remove_package"`
+	ReplacePackage   string   `json:"replace_package"`
+	WithPackage      string   `json:"with_package"`
+	TargetImage      string   `json:"target_image"`
+	NextDependencies []string `json:"next_dependencies"`
+}
+
+func (a *CoderAgent) planDependencyRecovery(ctx context.Context, dependencies []string, pipError string) (*dependencyRecoveryPlan, error) {
+	if a == nil || a.ChatModel == nil {
+		return nil, fmt.Errorf("chat model is not configured")
+	}
+
+	systemPrompt := `你是一个 Python 依赖安装修复代理。你的任务不是生成代码，而是根据 pip 安装失败日志输出一个严格 JSON 修复动作。
+
+规则：
+1. 只输出 JSON，不要 markdown，不要解释。
+2. action 只能是：
+   - "remove_package"
+   - "replace_package"
+   - "upgrade_python"
+   - "rewrite_dependencies"
+   - "abort"
+3. 如果报错是标准库被误装（例如 shutil、pathlib、typing），优先 remove_package。
+4. 如果报错包含 Requires-Python >=3.10/3.11/3.12，优先 upgrade_python，并把 target_image 设为兼容的 python:3.10-bullseye / python:3.11-bullseye / python:3.12-bullseye。
+5. 如果只是一个包名明显写错，可用 replace_package。
+6. 只有在确实需要整体重写时才用 rewrite_dependencies，且 next_dependencies 必须是完整的新依赖列表。
+7. 不要凭空删除大量依赖；保持最小改动。
+
+返回格式：
+{
+  "action": "remove_package",
+  "reason": "一句话说明",
+  "remove_package": "",
+  "replace_package": "",
+  "with_package": "",
+  "target_image": "",
+  "next_dependencies": []
+}`
+
+	userPrompt := fmt.Sprintf("当前依赖列表(JSON):\n%s\n\npip 错误日志:\n%s", mustJSON(dependencies), pipError)
+	msg, err := a.ChatModel.Generate(ctx, []*schema.Message{
+		{Role: schema.System, Content: systemPrompt},
+		{Role: schema.User, Content: userPrompt},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	cleaned := cleanJSONFence(msg.Content)
+	var plan dependencyRecoveryPlan
+	if err := json.Unmarshal([]byte(cleaned), &plan); err != nil {
+		return nil, fmt.Errorf("parse dependency recovery plan failed: %w", err)
+	}
+	plan.Action = strings.TrimSpace(plan.Action)
+	plan.Reason = strings.TrimSpace(plan.Reason)
+	return &plan, nil
+}
+
+func (a *CoderAgent) applyDependencyRecoveryPlan(ctx context.Context, task *models.Task, dependencies []string, runtimeSession string, mountPath string, plan *dependencyRecoveryPlan) ([]string, string, bool, error) {
+	if plan == nil {
+		return dependencies, runtimeSession, false, nil
+	}
+
+	switch strings.TrimSpace(plan.Action) {
+	case "remove_package":
+		name := strings.TrimSpace(plan.RemovePackage)
+		if name == "" {
+			return dependencies, runtimeSession, false, fmt.Errorf("react remove_package plan missing package name")
+		}
+		next := dropDependencyByRoot(dependencies, name)
+		if sameStringSlice(next, dependencies) {
+			return dependencies, runtimeSession, false, nil
+		}
+		return next, runtimeSession, true, nil
+	case "replace_package":
+		from := strings.TrimSpace(plan.ReplacePackage)
+		to := strings.TrimSpace(plan.WithPackage)
+		if from == "" || to == "" {
+			return dependencies, runtimeSession, false, fmt.Errorf("react replace_package plan missing fields")
+		}
+		next := replaceDependencyByRoot(dependencies, from, to)
+		if sameStringSlice(next, dependencies) {
+			return dependencies, runtimeSession, false, nil
+		}
+		return next, runtimeSession, true, nil
+	case "rewrite_dependencies":
+		next := filterStandardLibraryDependencies(normalizeDependenciesForPython39(uniqueDependencies(plan.NextDependencies)))
+		if len(next) == 0 {
+			return dependencies, runtimeSession, false, fmt.Errorf("react rewrite_dependencies plan produced empty dependency list")
+		}
+		if sameStringSlice(next, dependencies) {
+			return dependencies, runtimeSession, false, nil
+		}
+		return next, runtimeSession, true, nil
+	case "upgrade_python":
+		targetImage := strings.TrimSpace(plan.TargetImage)
+		if targetImage == "" {
+			targetImage = choosePythonUpgradeImage(plan.Reason)
+		}
+		nextRuntimeSession, err := a.recreateSandboxForDependencies(ctx, task, runtimeSession, mountPath, targetImage)
+		if err != nil {
+			return dependencies, runtimeSession, false, err
+		}
+		return dependencies, nextRuntimeSession, true, nil
+	case "abort", "":
+		return dependencies, runtimeSession, false, nil
+	default:
+		return dependencies, runtimeSession, false, fmt.Errorf("unknown react action %q", plan.Action)
+	}
+}
+
+func (a *CoderAgent) applyRuleBasedDependencyFallback(ctx context.Context, task *models.Task, dependencies []string, runtimeSession string, mountPath string, errText string) ([]string, string, bool, string, error) {
+	if pipErrorIndicatesPythonVersionMismatch(errText) {
+		targetImage := choosePythonUpgradeImage(errText)
+		nextRuntimeSession, err := a.recreateSandboxForDependencies(ctx, task, runtimeSession, mountPath, targetImage)
+		if err != nil {
+			return dependencies, runtimeSession, false, "", fmt.Errorf("%s; additionally failed to create upgraded sandbox %q: %v", errText, targetImage, err)
+		}
+		return dependencies, nextRuntimeSession, true, "upgrade python sandbox after Requires-Python mismatch", nil
+	}
+
+	if missing, ok := pipErrorMissingRequirement(errText); ok {
+		// 如果 missing 是标准库模块，说明依赖识别链路还漏了一层清洗，直接删掉再试。
+		if len(filterStandardLibraryDependencies([]string{missing})) == 0 {
+			nextDependencies := dropDependencyByRoot(dependencies, missing)
+			if !sameStringSlice(nextDependencies, dependencies) {
+				return nextDependencies, runtimeSession, true, fmt.Sprintf("remove stdlib module %q from dependency list", missing), nil
+			}
+		}
+	}
+
+	return dependencies, runtimeSession, false, "", nil
+}
+
+func (a *CoderAgent) recreateSandboxForDependencies(ctx context.Context, task *models.Task, runtimeSession string, mountPath string, targetImage string) (string, error) {
+	if a == nil || a.Sandbox == nil {
+		return "", fmt.Errorf("sandbox client is not configured")
+	}
+	newSandboxID, err := a.Sandbox.CreatePersistentSandbox(ctx, task.ID+"-py-upgrade", targetImage, mountPath)
+	if err != nil {
+		return "", err
+	}
+	logToContext(ctx, "[%s] Switching sandbox %s -> %s (%s) for dependency retry.", a.Name, runtimeSession, newSandboxID, targetImage)
+	_ = a.Sandbox.CleanupSandbox(context.Background(), runtimeSession)
+	return newSandboxID, nil
 }
 
 func pipErrorIndicatesPythonVersionMismatch(text string) bool {
@@ -663,6 +819,65 @@ func dropDependencyByRoot(items []string, root string) []string {
 		out = append(out, item)
 	}
 	return out
+}
+
+func replaceDependencyByRoot(items []string, from string, to string) []string {
+	from = strings.ToLower(strings.TrimSpace(from))
+	to = strings.TrimSpace(to)
+	if from == "" || to == "" {
+		return items
+	}
+	out := make([]string, 0, len(items))
+	replaced := false
+	for _, item := range items {
+		name := strings.ToLower(strings.TrimSpace(item))
+		if name == "" {
+			continue
+		}
+		root := strings.Split(name, "[")[0]
+		root = strings.Split(root, "<")[0]
+		root = strings.Split(root, ">")[0]
+		root = strings.Split(root, "=")[0]
+		root = strings.TrimSpace(root)
+		if root == from {
+			out = append(out, to)
+			replaced = true
+			continue
+		}
+		out = append(out, item)
+	}
+	if !replaced {
+		out = append(out, to)
+	}
+	return uniqueDependencies(out)
+}
+
+func sameStringSlice(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for idx := range left {
+		if left[idx] != right[idx] {
+			return false
+		}
+	}
+	return true
+}
+
+func cleanJSONFence(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned)
+}
+
+func mustJSON(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "[]"
+	}
+	return string(encoded)
 }
 
 func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task) error {
@@ -1089,9 +1304,9 @@ func normalizeDependenciesForPython39(items []string) []string {
 		name := strings.TrimSpace(item)
 		switch strings.ToLower(name) {
 		case "oscar==2.2.1":
-			// 最小纠错：PyPI 上 `oscar` 没有 2.2.1（常见误写，实际多为 `django-oscar`）。
-			// 仅对这个已观测到的失败版本做替换，避免误伤其它同名包的合法用法。
-			appendOnce("django-oscar==2.2.1")
+			// 最小纠错：PyPI 上 `oscar` 没有 2.2.1；结合实际安装日志，
+			// `django-oscar` 可用到 2.2，因此降到已存在的稳定版本。
+			appendOnce("django-oscar==2.2")
 		case "llama-index":
 			appendOnce("llama-index<0.12")
 			appendOnce("pydantic<2.10")

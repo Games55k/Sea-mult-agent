@@ -51,13 +51,30 @@ func (e *NativeDockerEngine) Create(ctx context.Context, image string, mountPath
 	if err != nil {
 		return "", fmt.Errorf("Docker run failed: %v, output: %s", err, string(output))
 	}
-	containerID := strings.TrimSpace(string(output))
+	containerID := extractContainerIDFromDockerRunOutput(string(output))
+	if containerID == "" {
+		return "", fmt.Errorf("Docker run returned empty container id, output: %s", string(output))
+	}
 	if mountPath != "" {
 		e.mu.Lock()
 		e.mountPaths[containerID] = mountPath
 		e.mu.Unlock()
 	}
 	return containerID, nil
+}
+
+func extractContainerIDFromDockerRunOutput(raw string) string {
+	// `docker run -d` may print image pull progress before the final container id
+	// when the image is not present locally. We only want the last non-empty line.
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		return line
+	}
+	return ""
 }
 
 func normalizeDockerMountPath(mountPath string) (string, error) {
