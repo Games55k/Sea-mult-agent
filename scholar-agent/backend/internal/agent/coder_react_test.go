@@ -95,3 +95,17 @@ func TestPlanDependencyRecovery_UpgradePython(t *testing.T) {
 		t.Fatalf("unexpected plan: %+v", plan)
 	}
 }
+
+func TestMapPythonImportToPackage_LlamaIndexPlugin(t *testing.T) {
+	got := mapPythonImportToPackage("llama_index.llms.openai")
+	if got != "llama-index-llms-openai" {
+		t.Fatalf("expected llama-index-llms-openai, got %q", got)
+	}
+}
+
+func TestShouldAttemptPythonRuntimeCodeRepair_ImportError(t *testing.T) {
+	errText := "ImportError: cannot import name 'OpenAI' from 'llama_index.core.llms'"
+	if !shouldAttemptPythonRuntimeCodeRepair(errText) {
+		t.Fatalf("expected import compatibility error to trigger runtime code repair")
+	}
+}

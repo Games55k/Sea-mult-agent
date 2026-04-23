@@ -889,15 +889,18 @@ var pythonStandardLibraryModules = map[string]struct{}{
 }
 
 var pythonImportPackageMap = map[string]string{
-	"cv2":                 "opencv-python",
-	"sklearn":             "scikit-learn",
-	"PIL":                 "pillow",
-	"bs4":                 "beautifulsoup4",
-	"yaml":                "pyyaml",
-	"llama_index":         "llama-index",
-	"langchain_openai":    "langchain-openai",
-	"langchain_community": "langchain-community",
-	"faiss":               "faiss-cpu",
+	"cv2":                              "opencv-python",
+	"sklearn":                          "scikit-learn",
+	"PIL":                              "pillow",
+	"bs4":                              "beautifulsoup4",
+	"yaml":                             "pyyaml",
+	"llama_index":                      "llama-index",
+	"llama_index.llms.openai":          "llama-index-llms-openai",
+	"llama_index.embeddings.openai":    "llama-index-embeddings-openai",
+	"llama_index.vector_stores.chroma": "llama-index-vector-stores-chroma",
+	"langchain_openai":                 "langchain-openai",
+	"langchain_community":              "langchain-community",
+	"faiss":                            "faiss-cpu",
 }
 
 func isPythonStandardLibraryModule(name string) bool {
@@ -926,7 +929,14 @@ func mapPythonImportToPackage(root string) string {
 	if mapped, ok := pythonImportPackageMap[strings.ToLower(root)]; ok {
 		return mapped
 	}
-	return root
+	primary := strings.Split(root, ".")[0]
+	if mapped, ok := pythonImportPackageMap[primary]; ok {
+		return mapped
+	}
+	if mapped, ok := pythonImportPackageMap[strings.ToLower(primary)]; ok {
+		return mapped
+	}
+	return primary
 }
 
 func extractMissingPythonModule(errText string) string {
@@ -956,6 +966,57 @@ func extractMissingPythonModule(errText string) string {
 		}
 	}
 	return ""
+}
+
+func cleanCodeFence(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	for _, prefix := range []string{"```python", "```py", "```"} {
+		if strings.HasPrefix(cleaned, prefix) {
+			cleaned = strings.TrimSpace(strings.TrimPrefix(cleaned, prefix))
+		}
+	}
+	if strings.HasSuffix(cleaned, "```") {
+		cleaned = strings.TrimSpace(strings.TrimSuffix(cleaned, "```"))
+	}
+	return cleaned
+}
+
+func shouldAttemptPythonRuntimeCodeRepair(errText string) bool {
+	lower := strings.ToLower(errText)
+	return strings.Contains(lower, "importerror: cannot import name") ||
+		strings.Contains(lower, "attributeerror: module") ||
+		strings.Contains(lower, "llama_index")
+}
+
+func (a *CoderAgent) repairGeneratedPythonCodeForRuntimeError(ctx context.Context, code string, errText string) (string, bool, error) {
+	if a == nil || a.ChatModel == nil || strings.TrimSpace(code) == "" || !shouldAttemptPythonRuntimeCodeRepair(errText) {
+		return "", false, nil
+	}
+
+	prompt := fmt.Sprintf(
+		"下面这段 Python 代码运行失败，请根据错误日志直接修复完整代码。\n"+
+			"要求：\n"+
+			"1. 优先修复第三方库 API/导入路径兼容问题，例如库升级后类或函数被迁移。\n"+
+			"2. 如果是 llama-index 相关导入错误，优先改成新导入路径，而不是继续使用旧路径。\n"+
+			"3. 不要在代码里增加 pip install 之类的安装语句。\n"+
+			"4. 只返回修复后的完整 Python 代码，不要 markdown，不要解释。\n\n"+
+			"错误日志：\n%s\n\n原始代码：\n```python\n%s\n```",
+		errText,
+		code,
+	)
+	msg, err := a.ChatModel.Generate(ctx, []*schema.Message{
+		{Role: schema.System, Content: a.SystemPrompt},
+		{Role: schema.User, Content: prompt},
+	})
+	if err != nil {
+		return "", false, err
+	}
+
+	repaired := cleanCodeFence(msg.Content)
+	if strings.TrimSpace(repaired) == "" || strings.TrimSpace(repaired) == strings.TrimSpace(code) {
+		return "", false, nil
+	}
+	return repaired, true, nil
 }
 
 func (a *CoderAgent) runPythonTaskInSandbox(ctx context.Context, sandboxID string, workspacePath string, codeFilePath string, code string) (*sandbox.PythonRunResponse, error) {
@@ -1044,42 +1105,56 @@ func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task
 		defer a.Sandbox.CleanupSandbox(context.Background(), sandboxID)
 	}
 
-	res, err := a.runPythonTaskInSandbox(ctx, sandboxID, workspacePath, codeFilePath, code)
-	if err != nil {
-		if strings.Contains(err.Error(), "python syntax validation failed") {
+	executesMountedFile := strings.TrimSpace(workspacePath) != "" && strings.TrimSpace(codeFilePath) != ""
+	codeRepaired := false
+	moduleRecovered := false
+	var (
+		res *sandbox.PythonRunResponse
+		err error
+	)
+	for {
+		res, err = a.runPythonTaskInSandbox(ctx, sandboxID, workspacePath, codeFilePath, code)
+		if err != nil {
 			task.Status = models.StatusFailed
 			task.Error = fmt.Sprintf("sandbox execution failed: %v", err)
 			return err
 		}
-		task.Status = models.StatusFailed
-		task.Error = fmt.Sprintf("sandbox execution failed: %v", err)
-		return err
-	}
-	if res == nil {
-		task.Status = models.StatusFailed
-		task.Error = "sandbox execution returned nil response"
-		return fmt.Errorf("%s", task.Error)
-	}
-	if res.ExitCode != 0 {
+		if res == nil {
+			task.Status = models.StatusFailed
+			task.Error = "sandbox execution returned nil response"
+			return fmt.Errorf("%s", task.Error)
+		}
+		if res.ExitCode == 0 {
+			break
+		}
+
 		errText := strings.TrimSpace(res.Stderr)
 		if errText == "" {
 			errText = fmt.Sprintf("sandbox exited with code %d", res.ExitCode)
 		}
-		if retried, installErr := a.installMissingPythonModule(ctx, sandboxID, errText); installErr == nil && retried {
-			res, err = a.runPythonTaskInSandbox(ctx, sandboxID, workspacePath, codeFilePath, code)
-			if err != nil {
-				task.Status = models.StatusFailed
-				task.Error = fmt.Sprintf("sandbox execution failed after dependency retry: %v", err)
-				return err
+
+		// 第一层兜底：模块缺失时优先在当前运行时最小补装，再重跑一次。
+		if !moduleRecovered {
+			if retried, installErr := a.installMissingPythonModule(ctx, sandboxID, errText); installErr == nil && retried {
+				moduleRecovered = true
+				continue
+			} else if installErr != nil {
+				logToContext(ctx, "[%s] runtime missing-module recovery failed: %v", a.Name, installErr)
 			}
-			if res == nil {
-				task.Status = models.StatusFailed
-				task.Error = "sandbox execution returned nil response after dependency retry"
-				return fmt.Errorf("%s", task.Error)
-			}
-		} else if installErr != nil {
-			logToContext(ctx, "[%s] runtime missing-module recovery failed: %v", a.Name, installErr)
 		}
+
+		// 第二层兜底：仅对直接执行的生成代码做一次 API 兼容修复，避免改动挂载仓库源码。
+		if !executesMountedFile && !codeRepaired {
+			if repairedCode, repaired, repairErr := a.repairGeneratedPythonCodeForRuntimeError(ctx, code, errText); repairErr == nil && repaired {
+				code = repairedCode
+				codeRepaired = true
+				logToContext(ctx, "[%s] runtime code repair applied, rerunning generated Python code", a.Name)
+				continue
+			} else if repairErr != nil {
+				logToContext(ctx, "[%s] runtime code repair failed: %v", a.Name, repairErr)
+			}
+		}
+		break
 	}
 	if res.ExitCode != 0 {
 		task.Status = models.StatusFailed
@@ -1321,11 +1396,11 @@ func detectPythonDependencies(code string) []string {
 				if len(name) == 0 {
 					continue
 				}
-				root := strings.Split(name[0], ".")[0]
-				if isPythonStandardLibraryModule(root) {
+				importPath := name[0]
+				if isPythonStandardLibraryModule(importPath) {
 					continue
 				}
-				deps = append(deps, mapPythonImportToPackage(root))
+				deps = append(deps, mapPythonImportToPackage(importPath))
 			}
 		}
 		if strings.HasPrefix(trimmed, "from ") {
@@ -1333,11 +1408,11 @@ func detectPythonDependencies(code string) []string {
 			if len(parts) < 2 {
 				continue
 			}
-			root := strings.Split(parts[1], ".")[0]
-			if isPythonStandardLibraryModule(root) {
+			importPath := parts[1]
+			if isPythonStandardLibraryModule(importPath) {
 				continue
 			}
-			deps = append(deps, mapPythonImportToPackage(root))
+			deps = append(deps, mapPythonImportToPackage(importPath))
 		}
 	}
 
