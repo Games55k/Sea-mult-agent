@@ -22,6 +22,16 @@ const (
 	defaultPipTimeoutSec = "60"
 )
 
+const frameworkBenchmarkCodeConstraints = `
+9. 【框架对比 / RAG Benchmark 硬性约束】如果任务涉及 LangChain、LlamaIndex、Haystack、RAG、benchmark、性能评测或框架对比：
+   - 生成的 benchmark 必须离线可跑，不得依赖真实 OpenAI/Anthropic/DeepSeek/DashScope 等外部模型或 embedding API。
+   - 禁止在代码中写入 sk-placeholder、your-api-key、OPENAI_API_KEY=... 等占位密钥，也不要从环境变量强制读取真实 API Key。
+   - 必须使用确定性的本地 mock/fake LLM 与本地 embedding，例如 FakeListLLM、MockLLM、HashingVectorizer/TF-IDF、numpy hash 向量或自定义 FakeEmbedding。
+   - 如果确实需要比较 RAG 流程性能，只比较本地索引构建、检索耗时、端到端 mock 调用耗时、吞吐等可离线测量指标。
+   - 不要在同一个框架分支里同时 benchmark 另一个框架；LangChain 节点只生成 LangChain 代码，LlamaIndex 节点只生成 LlamaIndex 代码。
+   - 输出代码前必须自检 Python 3.9 语法，尤其不要生成无效 f-string，例如 {value{format_str}}；动态格式化请使用 format(value, spec) 或固定格式化表达式。
+   - 依赖应尽量少且版本稳定，避免引入需要大型模型权重、GPU、Torch/TensorFlow 或真实云 API 的包。`
+
 // Agent 接口定义了系统中自治工作者的标准行为
 type Agent interface {
 	// ExecuteTask 执行分配给该 Agent 的具体任务
@@ -85,6 +95,7 @@ func NewCoderAgent(sandbox *sandbox.SandboxClient) *CoderAgent {
 
 	// 初始化真实的 Eino 编排链 (Real LLM -> Sandbox Execution)
 	agent.SystemPrompt += "\n7. 代码必须兼容 Python 3.9，禁止使用 Python 3.10+ 语法，例如 match/case、except*、以及 X | Y 类型联合语法；请改用 typing.Optional 或 typing.Union。\n8. 生成依赖框架代码时，优先选择 Python 3.9 可用且稳定的 API，避免依赖只在更新解释器下可运行的新特性。"
+	agent.SystemPrompt += frameworkBenchmarkCodeConstraints
 	agent.initRealEinoChain()
 
 	return agent
@@ -985,7 +996,13 @@ func shouldAttemptPythonRuntimeCodeRepair(errText string) bool {
 	lower := strings.ToLower(errText)
 	return strings.Contains(lower, "importerror: cannot import name") ||
 		strings.Contains(lower, "attributeerror: module") ||
-		strings.Contains(lower, "llama_index")
+		strings.Contains(lower, "llama_index") ||
+		strings.Contains(lower, "syntaxerror:") ||
+		strings.Contains(lower, "f-string: invalid syntax") ||
+		strings.Contains(lower, "invalid_api_key") ||
+		strings.Contains(lower, "incorrect api key") ||
+		strings.Contains(lower, "authenticationerror") ||
+		strings.Contains(lower, "sk-placeholder")
 }
 
 func (a *CoderAgent) repairGeneratedPythonCodeForRuntimeError(ctx context.Context, code string, errText string) (string, bool, error) {
@@ -998,8 +1015,10 @@ func (a *CoderAgent) repairGeneratedPythonCodeForRuntimeError(ctx context.Contex
 			"要求：\n"+
 			"1. 优先修复第三方库 API/导入路径兼容问题，例如库升级后类或函数被迁移。\n"+
 			"2. 如果是 llama-index 相关导入错误，优先改成新导入路径，而不是继续使用旧路径。\n"+
-			"3. 不要在代码里增加 pip install 之类的安装语句。\n"+
-			"4. 只返回修复后的完整 Python 代码，不要 markdown，不要解释。\n\n"+
+			"3. 如果错误是 SyntaxError 或 f-string: invalid syntax，必须修正为 Python 3.9 可解析的语法；动态格式化请用 format(value, spec)。\n"+
+			"4. 如果错误涉及 invalid_api_key、AuthenticationError、sk-placeholder、OpenAI embedding/LLM 调用，必须改为完全离线的 mock/fake LLM 与本地 embedding，不要读取真实 API Key。\n"+
+			"5. 不要在代码里增加 pip install 之类的安装语句。\n"+
+			"6. 只返回修复后的完整 Python 代码，不要 markdown，不要解释。\n\n"+
 			"错误日志：\n%s\n\n原始代码：\n```python\n%s\n```",
 		errText,
 		code,
@@ -1115,6 +1134,17 @@ func (a *CoderAgent) executeCodeInSandbox(ctx context.Context, task *models.Task
 	for {
 		res, err = a.runPythonTaskInSandbox(ctx, sandboxID, workspacePath, codeFilePath, code)
 		if err != nil {
+			errText := err.Error()
+			if !executesMountedFile && !codeRepaired {
+				if repairedCode, repaired, repairErr := a.repairGeneratedPythonCodeForRuntimeError(ctx, code, errText); repairErr == nil && repaired {
+					code = repairedCode
+					codeRepaired = true
+					logToContext(ctx, "[%s] runtime code repair applied after validation error, rerunning generated Python code", a.Name)
+					continue
+				} else if repairErr != nil {
+					logToContext(ctx, "[%s] runtime code repair after validation error failed: %v", a.Name, repairErr)
+				}
+			}
 			task.Status = models.StatusFailed
 			task.Error = fmt.Sprintf("sandbox execution failed: %v", err)
 			return err

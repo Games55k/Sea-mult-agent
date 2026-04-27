@@ -109,3 +109,31 @@ func TestShouldAttemptPythonRuntimeCodeRepair_ImportError(t *testing.T) {
 		t.Fatalf("expected import compatibility error to trigger runtime code repair")
 	}
 }
+
+func TestShouldAttemptPythonRuntimeCodeRepair_SyntaxAndAPIKey(t *testing.T) {
+	cases := []string{
+		"SyntaxError: f-string: invalid syntax",
+		"openai.AuthenticationError: Error code: 401 - invalid_api_key",
+		"Incorrect API key provided: sk-placeholder",
+	}
+	for _, errText := range cases {
+		if !shouldAttemptPythonRuntimeCodeRepair(errText) {
+			t.Fatalf("expected %q to trigger runtime code repair", errText)
+		}
+	}
+}
+
+func TestFrameworkBenchmarkCodeConstraints(t *testing.T) {
+	required := []string{
+		"框架对比 / RAG Benchmark",
+		"离线可跑",
+		"禁止在代码中写入 sk-placeholder",
+		"本地 mock/fake LLM",
+		"Python 3.9 语法",
+	}
+	for _, want := range required {
+		if !strings.Contains(frameworkBenchmarkCodeConstraints, want) {
+			t.Fatalf("frameworkBenchmarkCodeConstraints missing %q", want)
+		}
+	}
+}
