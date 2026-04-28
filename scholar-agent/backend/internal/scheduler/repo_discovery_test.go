@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"strings"
 	"testing"
 
 	"scholar-agent-backend/internal/models"
@@ -19,5 +20,39 @@ func TestBuildRepoDiscoveryQuery_PrefersStructuredInputs(t *testing.T) {
 	query := buildRepoDiscoveryQuery(task)
 	if query != "Attention Is All You Need" {
 		t.Fatalf("expected structured paper_title to win, got %q", query)
+	}
+}
+
+func TestCuratedRepoFallbackCandidates_AttentionPaper(t *testing.T) {
+	candidates := curatedRepoFallbackCandidates("Attention Is All You Need")
+	if len(candidates) == 0 {
+		t.Fatalf("expected curated fallback candidate")
+	}
+	if candidates[0].RepoURLs[0] != "https://github.com/harvardnlp/annotated-transformer" {
+		t.Fatalf("unexpected curated repo: %+v", candidates[0])
+	}
+
+	report := buildRepoDiscoveryReport(
+		"Attention Is All You Need",
+		candidates,
+		candidates[0].RepoURLs[0],
+		true,
+		true,
+		"context deadline exceeded",
+	)
+	if !strings.Contains(report, "Papers API warning") || !strings.Contains(report, "Selected repo_url: https://github.com/harvardnlp/annotated-transformer") {
+		t.Fatalf("fallback report missing warning or selected repo:\n%s", report)
+	}
+}
+
+func TestTrustedRepoCandidate_PrefersAnnotatedTransformerForAttention(t *testing.T) {
+	candidate := repoCandidate{
+		RepoName:    "harvardnlp/annotated-transformer",
+		Description: "An annotated implementation of the Transformer paper.",
+		RepoURLs:    []string{"https://github.com/harvardnlp/annotated-transformer"},
+		Source:      "github_search",
+	}
+	if !isTrustedRepoCandidate("Attention Is All You Need", candidate) {
+		t.Fatalf("expected annotated-transformer to be trusted for Attention Is All You Need")
 	}
 }

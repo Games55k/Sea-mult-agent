@@ -30,18 +30,26 @@ func main() {
 	api.SetupRoutes(r)
 
 	// Configure a custom HTTP server with generous timeouts for Agent execution
+	addr := serverAddr()
 	server := &http.Server{
-		Addr:         ":8080",
+		Addr:         addr,
 		Handler:      r,
 		ReadTimeout:  5 * time.Minute,
 		WriteTimeout: 5 * time.Minute, // SSE needs long write timeout
 		IdleTimeout:  10 * time.Minute,
 	}
 
-	log.Println("Starting server on :8080 with 5min timeouts...")
+	log.Printf("Starting server on %s with 5min timeouts...", addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+}
+
+func serverAddr() string {
+	if port := os.Getenv("PORT"); port != "" {
+		return ":" + port
+	}
+	return ":8080"
 }
 
 func configureFileLogging() {

@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"scholar-agent-backend/internal/models"
+	"scholar-agent-backend/internal/prompts"
 
 	openaiModel "github.com/cloudwego/eino-ext/components/model/openai"
 )
@@ -132,8 +137,124 @@ func TestFrameworkBenchmarkCodeConstraints(t *testing.T) {
 		"Python 3.9 语法",
 	}
 	for _, want := range required {
-		if !strings.Contains(frameworkBenchmarkCodeConstraints, want) {
+		if !strings.Contains(prompts.FrameworkBenchmarkCodeConstraints, want) {
 			t.Fatalf("frameworkBenchmarkCodeConstraints missing %q", want)
 		}
+	}
+}
+
+func TestCoderSystemPromptForTask_IsolatesFrameworkAndPaperModes(t *testing.T) {
+	frameworkPrompt := prompts.CoderSystemPromptForTask("Framework_Evaluation", "generate_code", "Generate LangChain Benchmark Code", "Plan intent type: Framework_Evaluation")
+	if !strings.Contains(frameworkPrompt, "框架对比 / RAG Benchmark") {
+		t.Fatalf("expected framework benchmark prompt to include framework constraints")
+	}
+	if strings.Contains(frameworkPrompt, "论文复现硬性约束") {
+		t.Fatalf("framework prompt must not include paper reproduction constraints")
+	}
+
+	paperPrompt := prompts.CoderSystemPromptForTask("Paper_Reproduction", "repo_prepare", "Prepare Workspace", "Plan intent type: Paper_Reproduction")
+	if !strings.Contains(paperPrompt, "论文复现硬性约束") {
+		t.Fatalf("expected paper reproduction prompt to include paper constraints")
+	}
+	if strings.Contains(paperPrompt, "框架对比 / RAG Benchmark") {
+		t.Fatalf("paper prompt must not include framework benchmark constraints")
+	}
+
+	genericPrompt := prompts.CoderSystemPromptForTask("Code_Execution", "generate_code", "Generate Code", "draw a plot")
+	if strings.Contains(genericPrompt, "框架对比 / RAG Benchmark") || strings.Contains(genericPrompt, "论文复现硬性约束") {
+		t.Fatalf("generic code prompt should not include framework or paper-specific constraints")
+	}
+}
+
+func TestDeterministicFrameworkBenchmarkCode_IsolatesBranchDependencies(t *testing.T) {
+	langchainTask := &models.Task{
+		Name:            "生成 LangChain 基准测试代码 / Generate LangChain Benchmark Code",
+		Type:            "generate_code",
+		OutputArtifacts: []string{"langchain_generated_code"},
+	}
+	code, ok := deterministicFrameworkBenchmarkCode(langchainTask)
+	if !ok {
+		t.Fatalf("expected deterministic LangChain benchmark code")
+	}
+	if strings.Contains(code, "pip install") || strings.Contains(code, "llama_index") || strings.Contains(code, "importlib.metadata") {
+		t.Fatalf("LangChain deterministic benchmark should not include inline pip, LlamaIndex code, or package metadata lookup")
+	}
+	deps := filterFrameworkBenchmarkDependencies(langchainTask, []string{"langchain", "llama-index", "sentence-transformers", "numpy"})
+	if len(deps) != 0 {
+		t.Fatalf("offline LangChain benchmark should not install dependencies: %v", deps)
+	}
+
+	llamaTask := &models.Task{
+		Name:            "生成 LlamaIndex 基准测试代码 / Generate LlamaIndex Benchmark Code",
+		Type:            "generate_code",
+		OutputArtifacts: []string{"llamaindex_generated_code"},
+	}
+	code, ok = deterministicFrameworkBenchmarkCode(llamaTask)
+	if !ok {
+		t.Fatalf("expected deterministic LlamaIndex benchmark code")
+	}
+	if strings.Contains(code, "pip install") || strings.Contains(code, "import langchain") || strings.Contains(code, "importlib.metadata") {
+		t.Fatalf("LlamaIndex deterministic benchmark should not include inline pip, LangChain code, or package metadata lookup")
+	}
+	deps = filterFrameworkBenchmarkDependencies(llamaTask, []string{"llama-index", "langchain", "chromadb", "faiss-cpu"})
+	if len(deps) != 0 {
+		t.Fatalf("offline LlamaIndex benchmark should not install dependencies: %v", deps)
+	}
+}
+
+func TestFilterWorkspaceLocalDependencies_RemovesRepoModules(t *testing.T) {
+	workspace := t.TempDir()
+	for _, file := range []string{
+		"src/config.py",
+		"src/learner.py",
+		"src/scheduler.py",
+		"src/dataset.py",
+		"src/callbacks.py",
+		"src/architectures/__init__.py",
+		"src/utils/__init__.py",
+	} {
+		path := filepath.Join(workspace, file)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("# local module\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deps := filterWorkspaceLocalDependencies(
+		[]string{"torch", "wandb", "config", "learner", "scheduler", "dataset", "callbacks", "architectures", "utils", "numpy"},
+		workspace,
+	)
+	if strings.Join(deps, ",") != "torch,wandb,numpy" {
+		t.Fatalf("unexpected filtered deps: %v", deps)
+	}
+}
+
+func TestNormalizeDependenciesForPython39_HandlesLegacyPaperRequirements(t *testing.T) {
+	deps := normalizeDependenciesForPython39([]string{
+		"python==3.6.12",
+		"pytorch==1.3.1",
+		"msgpack-python==1.0.2",
+		"tensorflow==1.14.0",
+		"numpy",
+	})
+	if strings.Join(deps, ",") != "torch,msgpack,numpy" {
+		t.Fatalf("unexpected normalized deps: %v", deps)
+	}
+}
+
+func TestDetectPythonDependencies_FiltersExpandedStdlibSet(t *testing.T) {
+	code := `
+from __future__ import division
+import inspect
+import codecs
+import urllib.request
+import tarfile
+import torch
+`
+	deps := detectPythonDependencies(code)
+	if strings.Join(deps, ",") != "torch" {
+		t.Fatalf("unexpected deps: %v", deps)
 	}
 }

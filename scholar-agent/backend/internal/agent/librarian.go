@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"scholar-agent-backend/internal/models"
+	"scholar-agent-backend/internal/prompts"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/compose"
@@ -19,33 +20,15 @@ type LibrarianAgent struct {
 	EinoChain    compose.Runnable[string, string]
 }
 
+type librarianContextKey string
+
+const librarianSystemPromptContextKey librarianContextKey = "librarian_system_prompt"
+
 func NewLibrarianAgent() *LibrarianAgent {
 	agent := &LibrarianAgent{
-		Name: "librarian_agent",
-		SystemPrompt: `你是一个专业的 AI 文献检索员与科研分析师。你的任务是根据用户提供的论文标题或相关要求，提供详细的文献分析报告，辅助科研人员阅读与理解。
-		请严格遵循以下规则：
-		1. 你**绝对不能**编写任何 Python 代码或 Shell 脚本。
-		2. 你的输出必须是一份结构化、清晰、专业的 Markdown 格式文献分析报告。
-		3. 报告应包含以下核心内容（如适用）：
-		   - 论文标题与核心背景（一句话总结）
-		   - 核心创新点与算法原理（通俗易懂的解释）
-		   - 网络架构/模型结构简述
-		   - 推荐的开源代码实现（如 GitHub 上的主流仓库）
-		   - 可能遇到的复现难点提示
-		4. 请直接输出内容，不要包含任何前缀如“好的，这是报告...”。`,
+		Name:         "librarian_agent",
+		SystemPrompt: prompts.LibrarianSystemPrompt,
 	}
-	agent.SystemPrompt = `你是一名专业的 AI 文献检索员和科研分析师。你的任务是根据用户提供的论文标题、研究主题或分析要求，输出结构化、清晰、专业的文献分析报告，帮助科研人员快速理解主题。
-
-请严格遵守以下规则：
-1. 不要编写任何 Python 代码或 Shell 脚本。
-2. 输出必须是结构化、清晰、专业的 Markdown 文献分析报告。
-3. 报告应尽量包含以下内容（如适用）：
-   - 论文标题与核心背景（一句话总结）
-   - 核心创新点与算法原理（用通俗语言解释）
-   - 网络架构或模型结构简述
-   - 推荐的开源代码实现（如 GitHub 上的主流仓库）
-   - 可能遇到的复现难点提示
-4. 直接输出正文，不要加“好的，这是报告”之类的前缀。`
 
 	agent.initEinoChain()
 	return agent
@@ -79,9 +62,13 @@ func (a *LibrarianAgent) initEinoChain() {
 
 	graph.AddLambdaNode("Prompt_Builder", compose.InvokableLambda(func(ctx context.Context, input string) ([]*schema.Message, error) {
 		logToContext(ctx, "[%s] Eino 节点 [Prompt_Builder]: 正在组装文献分析提示词", a.Name)
+		systemPrompt := a.SystemPrompt
+		if prompt, ok := ctx.Value(librarianSystemPromptContextKey).(string); ok && prompt != "" {
+			systemPrompt = prompt
+		}
 		messages := []*schema.Message{
-			{Role: schema.System, Content: a.SystemPrompt},
-			{Role: schema.User, Content: fmt.Sprintf("请解析并总结以下任务相关的文献内容：\n%s", input)},
+			{Role: schema.System, Content: systemPrompt},
+			{Role: schema.User, Content: prompts.LibrarianAnalysisUserPrompt(input)},
 		}
 		return messages, nil
 	}))
@@ -114,6 +101,8 @@ func (a *LibrarianAgent) ExecuteTask(ctx context.Context, task *models.Task, sha
 	if task != nil && len(task.Inputs) > 0 {
 		input = fmt.Sprintf("%s\n\n上游输入:\n%v", task.Description, task.Inputs)
 	}
+	intentType := sharedContextValue(sharedContext, "intent_type")
+	ctx = context.WithValue(ctx, librarianSystemPromptContextKey, prompts.LibrarianSystemPromptForTask(intentType, task.Type, task.Name, task.Description))
 
 	output, err := a.EinoChain.Invoke(ctx, input)
 	if err != nil {

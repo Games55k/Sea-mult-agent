@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"scholar-agent-backend/internal/models"
+	"scholar-agent-backend/internal/prompts"
 	"strings"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -22,14 +23,9 @@ type ChatAgent struct {
 
 func NewChatAgent(coder *CoderAgent) *ChatAgent {
 	agent := &ChatAgent{
-		Name: "chat_agent",
-		Coder: coder,
-		SystemPrompt: `你是一个专业的 AI 科研助理。你的任务是回答用户关于科研、论文、代码或技术选型的问题。
-		
-		【重要规则】：
-		1. 如果用户要求你“计算”、“运行代码”、“执行”、“画图”或任何需要 Python 环境的任务，请在回答的开头加上特殊的标记 [CODE_EXECUTION_REQUIRED]，然后给出你的分析。
-		2. 如果用户只是普通的咨询，则直接回答。
-		3. 你提供的代码应该是 Python 格式。`,
+		Name:         "chat_agent",
+		Coder:        coder,
+		SystemPrompt: prompts.ChatSystemPrompt,
 	}
 
 	agent.initEinoChain()
@@ -97,7 +93,7 @@ func (a *ChatAgent) Answer(ctx context.Context, question string) (string, error)
 	// 如果识别到需要执行代码，尝试自动执行并追加结果
 	if strings.Contains(response, "[CODE_EXECUTION_REQUIRED]") {
 		log.Printf("[%s] 检测到代码执行需求，正在调用 CoderAgent 自动执行...", a.Name)
-		
+
 		// 创建一个临时任务给 CoderAgent
 		tempTask := &models.Task{
 			ID:          "chat-exec-" + question[:min(len(question), 10)],

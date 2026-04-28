@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"scholar-agent-backend/internal/models"
+	"scholar-agent-backend/internal/prompts"
 	"strings"
 	"time"
 
@@ -135,7 +136,7 @@ func createMockTask(name, agent string, deps []string, context string) *models.T
 	return &models.Task{
 		ID:           uuid.New().String(),
 		Name:         displayName,
-		Description:  fmt.Sprintf("任务目标: %s\n具体要求: %s", displayName, context),
+		Description:  prompts.TaskDescription(displayName, context),
 		AssignedTo:   agent,
 		Status:       models.StatusPending,
 		Dependencies: deps,
@@ -161,7 +162,7 @@ func newNode(name, taskType, agent string, deps, requiredArtifacts, outputArtifa
 		ID:                uuid.New().String(),
 		Name:              displayName,
 		Type:              taskType,
-		Description:       fmt.Sprintf("任务目标: %s\n具体要求: %s", displayName, context),
+		Description:       prompts.TaskDescription(displayName, context),
 		AssignedTo:        agent,
 		Status:            models.StatusPending,
 		Dependencies:      deps,
@@ -207,7 +208,7 @@ func buildPaperReproductionNodes(context string) []*models.TaskNode {
 
 	t1 := newNode("Parse Paper & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
 	t2 := newRepoDiscoveryNode([]string{t1.ID}, context, models.IntentContext{})
-	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url"}, []string{"workspace_path"}, false, context)
+	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "candidate_repositories", "repo_validation_report"}, []string{"workspace_path"}, false, context)
 	t4 := newNode("Setup Runtime Environment", "env_setup", "sandbox_agent", []string{t3.ID}, []string{"workspace_path"}, []string{"runtime_env"}, false, context)
 	t5 := newNode("Execute Baseline", "baseline_run", "sandbox_agent", []string{t4.ID}, []string{"runtime_env"}, []string{"run_metrics"}, false, context)
 	t6 := newNode("Compare With Paper Claims", "paper_compare", "data_agent", []string{t5.ID}, []string{"run_metrics", "parsed_paper"}, []string{"comparison_report"}, false, context)
@@ -497,7 +498,7 @@ func buildPaperReproductionNodesV2(intent models.IntentContext) []*models.TaskNo
 
 	t1 := newNode("Parse "+paperTitle+" & Extract Method", "paper_parse", "librarian_agent", nil, nil, []string{"parsed_paper"}, true, context)
 	t2 := newRepoDiscoveryNode([]string{t1.ID}, context, intent)
-	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "repo_validation_report"}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, false, context)
+	t3 := newNode("Prepare Workspace", "repo_prepare", "coder_agent", []string{t2.ID}, []string{"repo_url", "candidate_repositories", "repo_validation_report"}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, false, context)
 	t4 := newNode("Resolve "+paperTitle+" Dependencies", "resolve_dependencies", "coder_agent", []string{t3.ID}, []string{"workspace_path", "code_file_path", "generated_code", "repo_manifest"}, []string{"dependency_spec"}, false, context)
 	t5 := newNode("Setup Runtime Environment", "prepare_runtime", "sandbox_agent", []string{t4.ID}, []string{"workspace_path", "dependency_spec"}, []string{"runtime_session"}, false, context)
 	t6 := newNode("Install "+paperTitle+" Dependencies", "install_dependencies", "sandbox_agent", []string{t5.ID}, []string{"runtime_session", "dependency_spec"}, []string{"prepared_runtime", "dependency_install_report"}, false, context)
@@ -713,15 +714,7 @@ func buildRepoDiscoveryInputs(intent models.IntentContext) map[string]any {
 }
 
 func buildRepoDiscoveryDescription(rawIntent string) string {
-	return "任务目标: 检索并定位论文对应的高可信公开仓库 / Retrieve and validate the most relevant public repository for the target paper\n" +
-		"具体要求:\n" +
-		"1. 优先使用 Papers with Code，根据论文标题、arXiv ID 或方法名检索论文记录。\n" +
-		"2. 若命中论文，则读取其关联代码仓库列表，整理候选仓库。\n" +
-		"3. 若 Papers with Code 无结果或结果不足，再使用 GitHub 搜索作为回退来源。\n" +
-		"4. 对候选仓库做规则校验与排序：公开可访问、仓库名/README 与论文标题或方法名匹配、实现说明清晰、活跃度合理。\n" +
-		"5. 输出结构化结果：candidate_repositories（候选仓库列表）、repo_validation_report（筛选与排序依据）、repo_url（最终选中的仓库 URL）。\n" +
-		"6. 若没有高置信仓库，必须明确说明未找到可靠公开实现，不要编造链接。\n" +
-		"用户原始意图: " + rawIntent
+	return prompts.RepoDiscoveryDescription(rawIntent)
 }
 
 func bilingualTaskName(name string) string {

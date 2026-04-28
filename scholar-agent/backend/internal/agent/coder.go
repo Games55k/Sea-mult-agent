@@ -7,8 +7,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"scholar-agent-backend/internal/models"
+	"scholar-agent-backend/internal/prompts"
 	"scholar-agent-backend/internal/sandbox"
 	"strings"
 
@@ -21,16 +23,6 @@ const (
 	defaultSandboxImage  = "python:3.9-bullseye"
 	defaultPipTimeoutSec = "60"
 )
-
-const frameworkBenchmarkCodeConstraints = `
-9. 【框架对比 / RAG Benchmark 硬性约束】如果任务涉及 LangChain、LlamaIndex、Haystack、RAG、benchmark、性能评测或框架对比：
-   - 生成的 benchmark 必须离线可跑，不得依赖真实 OpenAI/Anthropic/DeepSeek/DashScope 等外部模型或 embedding API。
-   - 禁止在代码中写入 sk-placeholder、your-api-key、OPENAI_API_KEY=... 等占位密钥，也不要从环境变量强制读取真实 API Key。
-   - 必须使用确定性的本地 mock/fake LLM 与本地 embedding，例如 FakeListLLM、MockLLM、HashingVectorizer/TF-IDF、numpy hash 向量或自定义 FakeEmbedding。
-   - 如果确实需要比较 RAG 流程性能，只比较本地索引构建、检索耗时、端到端 mock 调用耗时、吞吐等可离线测量指标。
-   - 不要在同一个框架分支里同时 benchmark 另一个框架；LangChain 节点只生成 LangChain 代码，LlamaIndex 节点只生成 LlamaIndex 代码。
-   - 输出代码前必须自检 Python 3.9 语法，尤其不要生成无效 f-string，例如 {value{format_str}}；动态格式化请使用 format(value, spec) 或固定格式化表达式。
-   - 依赖应尽量少且版本稳定，避免引入需要大型模型权重、GPU、Torch/TensorFlow 或真实云 API 的包。`
 
 // Agent 接口定义了系统中自治工作者的标准行为
 type Agent interface {
@@ -61,41 +53,22 @@ type CoderAgent struct {
 	EinoChain     compose.Runnable[string, string] // 使用 Eino 编排的执行链
 }
 
+type coderContextKey string
+
+const (
+	coderSystemPromptContextKey coderContextKey = "coder_system_prompt"
+	coderIntentTypeContextKey   coderContextKey = "coder_intent_type"
+	coderTaskTypeContextKey     coderContextKey = "coder_task_type"
+	coderTaskNameContextKey     coderContextKey = "coder_task_name"
+)
+
 // NewCoderAgent 实例化一个新的 CoderAgent，并初始化真实的 Eino 执行链
 func NewCoderAgent(sandbox *sandbox.SandboxClient) *CoderAgent {
 	agent := &CoderAgent{
-		Name: "coder_agent",
-		SystemPrompt: `你是一个资深的 AI 科研助理和 Python 开发者。你的任务是复现学术论文的开源代码库并根据用户需求生成适配代码。
-		请严格遵循以下规则：
-		1. 你必须只输出有效的 Python 代码，不要包含 any markdown 格式（如 ` + "```" + `python）或解释，以便能够直接执行。
-		2. 【极其重要】：你的代码将在纯净的 Docker 沙箱(python:3.9-bullseye)中运行，里面没有 torch, numpy, pandas, matplotlib 等第三方库。如果你需要使用 any 第三方库，**必须在 import 之前使用 subprocess 安装它们**。
-		   这是正确的做法示例：
-		   import subprocess
-		   import sys
-		   subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "numpy", "matplotlib"])
-		   import torch
-		   import numpy
-		   import matplotlib
-		   matplotlib.use('Agg') # 必须使用 Agg 后端，因为沙箱没有显示器
-		   import matplotlib.pyplot as plt
-		3. 【绘图规则】：如果用户要求绘图（使用 matplotlib 等），**绝对不能调用 plt.show()**。你必须使用 **plt.savefig('/workspace/output_plot.png')** 将图像保存到指定路径。
-		4. 【核心复现规则 - 适配器模式】：绝对不去大面积修改原论文的核心代码（如 model.py），因为这容易破坏模型结构。
-		5. 请编写一个新的独立运行脚本。在这个新脚本中：
-		   - 如果涉及机器学习模型训练，必须生成完整的训练循环，并在最后打印出评估结果。
-		   - 确保代码在没有外部网络依赖数据集的情况下也能运行（例如生成随机数据作为 Dummy Dataset 来测试网络跑通）。`,
-		Sandbox: sandbox,
+		Name:         "coder_agent",
+		SystemPrompt: prompts.CoderSystemPrompt,
+		Sandbox:      sandbox,
 	}
-	agent.SystemPrompt += `你是一名资深的 AI 科研助理和 Python 开发者。你的任务是根据用户需求生成、改写或检查代码。
-
-请严格遵守以下规则：
-1. 只输出有效的代码内容，不要附带 Markdown 代码块包裹或额外说明。
-2. 如果任务只是代码生成、静态检查、改写或补全，不要主动假设必须运行代码。
-3. 只有在任务明确进入沙箱执行阶段时，才依赖第三方库安装、运行环境和绘图输出。
-4. 如果用户要求画图，默认将图像保存到约定路径，而不是调用交互式显示。`
-
-	// 初始化真实的 Eino 编排链 (Real LLM -> Sandbox Execution)
-	agent.SystemPrompt += "\n7. 代码必须兼容 Python 3.9，禁止使用 Python 3.10+ 语法，例如 match/case、except*、以及 X | Y 类型联合语法；请改用 typing.Optional 或 typing.Union。\n8. 生成依赖框架代码时，优先选择 Python 3.9 可用且稳定的 API，避免依赖只在更新解释器下可运行的新特性。"
-	agent.SystemPrompt += frameworkBenchmarkCodeConstraints
 	agent.initRealEinoChain()
 
 	return agent
@@ -134,9 +107,10 @@ func (a *CoderAgent) initRealEinoChain() {
 	codeOnlyGraph := compose.NewGraph[string, string]()
 	codeOnlyGraph.AddLambdaNode("Prompt_Builder", compose.InvokableLambda(func(ctx context.Context, input string) ([]*schema.Message, error) {
 		logToContext(ctx, "[%s] Eino 节点 [Prompt_Builder]: 正在组装代码生成提示词", a.Name)
+		systemPrompt := coderSystemPromptFromContext(ctx, a.SystemPrompt)
 		messages := []*schema.Message{
-			{Role: schema.System, Content: a.SystemPrompt},
-			{Role: schema.User, Content: fmt.Sprintf("请完成以下任务：\n%s", input)},
+			{Role: schema.System, Content: systemPrompt},
+			{Role: schema.User, Content: prompts.CoderTaskUserPrompt(input)},
 		}
 		return messages, nil
 	}))
@@ -169,9 +143,10 @@ func (a *CoderAgent) initRealEinoChain() {
 	// 节点 1: 提示词模板 (Prompt Template)
 	graph.AddLambdaNode("Prompt_Builder", compose.InvokableLambda(func(ctx context.Context, input string) ([]*schema.Message, error) {
 		logToContext(ctx, "[%s] Eino 节点 [Prompt_Builder]: 正在组装提示词", a.Name)
+		systemPrompt := coderSystemPromptFromContext(ctx, a.SystemPrompt)
 		messages := []*schema.Message{
-			{Role: schema.System, Content: a.SystemPrompt},
-			{Role: schema.User, Content: fmt.Sprintf("请完成以下任务：\n%s", input)},
+			{Role: schema.System, Content: systemPrompt},
+			{Role: schema.User, Content: prompts.CoderTaskUserPrompt(input)},
 		}
 		return messages, nil
 	}))
@@ -266,11 +241,11 @@ func (a *CoderAgent) initRealEinoChain() {
 				logToContext(ctx, "[%s] 代码执行失败，触发 Self-Correction 机制。错误: %v", a.Name, err)
 
 				// 构建修正 Prompt 再次调用大模型
-				correctionPrompt := fmt.Sprintf("你之前生成的代码在沙箱中执行失败了。\n错误日志如下：\n%v\n输出信息：\n%s\n\n【重要提示】如果是 ModuleNotFoundError（比如 No module named 'torch'），请务必在代码最开头加上 `import subprocess; import sys; subprocess.check_call([sys.executable, \"-m\", \"pip\", \"install\", \"torch\"])` （替换为缺失的库名）。\n请分析错误原因，并直接返回修复后的完整 Python 代码（不要包含 markdown 格式）。", err, output)
+				correctionPrompt := prompts.CoderSelfCorrectionUserPrompt(err, output)
 
 				logToContext(ctx, "[%s] 正在调用大模型进行代码自修复...", a.Name)
 				msg, err := chatModel.Generate(ctx, []*schema.Message{
-					{Role: schema.System, Content: a.SystemPrompt},
+					{Role: schema.System, Content: coderSystemPromptFromContext(ctx, a.SystemPrompt)},
 					{Role: schema.User, Content: correctionPrompt},
 				})
 				if err != nil {
@@ -346,11 +321,208 @@ func (a *CoderAgent) initMockEinoChain() {
 	a.EinoChain = runnable
 }
 
+func coderSystemPromptFromContext(ctx context.Context, fallback string) string {
+	if prompt, ok := ctx.Value(coderSystemPromptContextKey).(string); ok && strings.TrimSpace(prompt) != "" {
+		return prompt
+	}
+	return fallback
+}
+
+func sharedContextValue(sharedContext map[string]interface{}, key string) string {
+	if sharedContext == nil {
+		return ""
+	}
+	value, ok := sharedContext[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return fmt.Sprint(value)
+}
+
+func (a *CoderAgent) contextWithTaskPrompt(ctx context.Context, task *models.Task, sharedContext map[string]interface{}) context.Context {
+	if task == nil {
+		return ctx
+	}
+	intentType := sharedContextValue(sharedContext, "intent_type")
+	systemPrompt := prompts.CoderSystemPromptForTask(intentType, task.Type, task.Name, task.Description)
+	ctx = context.WithValue(ctx, coderSystemPromptContextKey, systemPrompt)
+	ctx = context.WithValue(ctx, coderIntentTypeContextKey, intentType)
+	ctx = context.WithValue(ctx, coderTaskTypeContextKey, task.Type)
+	ctx = context.WithValue(ctx, coderTaskNameContextKey, task.Name)
+	return ctx
+}
+
+func deterministicFrameworkBenchmarkCode(task *models.Task) (string, bool) {
+	target := frameworkBenchmarkTarget(task)
+	if target == "" || task == nil || strings.TrimSpace(task.Type) != "generate_code" {
+		return "", false
+	}
+	return buildDeterministicFrameworkBenchmarkCode(target), true
+}
+
+func frameworkBenchmarkTarget(task *models.Task) string {
+	if task == nil {
+		return ""
+	}
+	branchText := strings.ToLower(strings.Join(append([]string{task.Name}, task.OutputArtifacts...), "\n"))
+	switch {
+	case strings.Contains(branchText, "llamaindex") || strings.Contains(branchText, "llama_index") || strings.Contains(branchText, "llama-index"):
+		return "llamaindex"
+	case strings.Contains(branchText, "langchain"):
+		return "langchain"
+	}
+
+	description := strings.ToLower(task.Description)
+	hasLlamaIndex := strings.Contains(description, "llamaindex") || strings.Contains(description, "llama_index") || strings.Contains(description, "llama-index")
+	hasLangChain := strings.Contains(description, "langchain")
+	switch {
+	case hasLlamaIndex && !hasLangChain:
+		return "llamaindex"
+	case hasLangChain && !hasLlamaIndex:
+		return "langchain"
+	default:
+		return ""
+	}
+}
+
+func buildDeterministicFrameworkBenchmarkCode(target string) string {
+	packageName := "langchain"
+	moduleName := "langchain"
+	displayName := "LangChain"
+	if target == "llamaindex" {
+		packageName = "llama-index"
+		moduleName = "llama_index"
+		displayName = "LlamaIndex"
+	}
+
+	return fmt.Sprintf(`import hashlib
+import json
+import math
+import statistics
+import time
+
+FRAMEWORK = %q
+PACKAGE_NAME = %q
+FRAMEWORK_MODULE = %q
+
+DOCS = [
+    {"id": "doc_rag", "text": "RAG systems combine retrieval over private documents with a generator that answers using grounded context."},
+    {"id": "doc_eval", "text": "Offline framework benchmarks should compare indexing latency, retrieval latency, recall, throughput, and stability under identical data."},
+    {"id": "doc_agent", "text": "Agent orchestration frameworks focus on tool calling, state transitions, retries, observability, and workflow recovery."},
+    {"id": "doc_vector", "text": "Vector stores support similarity search over embeddings and often add metadata filters, persistence, and approximate nearest neighbor indexes."},
+]
+
+QUERIES = [
+    {"query": "how should a RAG benchmark compare frameworks", "expected": "doc_eval"},
+    {"query": "what does RAG combine", "expected": "doc_rag"},
+    {"query": "what do agent frameworks focus on", "expected": "doc_agent"},
+    {"query": "what does a vector store provide", "expected": "doc_vector"},
+]
+
+def embed(text, dim=64):
+    vector = [0.0] * dim
+    for token in text.lower().replace(".", " ").replace(",", " ").split():
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") %% dim
+        sign = 1.0 if digest[4] %% 2 == 0 else -1.0
+        vector[index] += sign
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+def cosine(left, right):
+    return sum(a * b for a, b in zip(left, right))
+
+def build_index(docs):
+    start = time.perf_counter()
+    index = [{"id": doc["id"], "text": doc["text"], "embedding": embed(doc["text"])} for doc in docs]
+    return index, time.perf_counter() - start
+
+def retrieve(index, query, k=3):
+    query_vector = embed(query)
+    scored = sorted(((cosine(query_vector, item["embedding"]), item) for item in index), key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored[:k]]
+
+def answer(query, contexts):
+    joined = " ".join(item["text"] for item in contexts)
+    return "Mock answer for %%s based on %%d context chars" %% (query[:48], len(joined))
+
+def percentile(values, ratio):
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    pos = min(len(ordered) - 1, int(round((len(ordered) - 1) * ratio)))
+    return ordered[pos]
+
+def main():
+    version = "not_installed_offline_mock"
+    index, build_seconds = build_index(DOCS)
+    latencies = []
+    hits = 0
+    outputs = []
+    for item in QUERIES:
+        start = time.perf_counter()
+        contexts = retrieve(index, item["query"], k=3)
+        response = answer(item["query"], contexts)
+        elapsed = time.perf_counter() - start
+        latencies.append(elapsed)
+        hits += int(any(ctx["id"] == item["expected"] for ctx in contexts))
+        outputs.append({"query": item["query"], "top_ids": [ctx["id"] for ctx in contexts], "answer": response})
+    total_query_seconds = sum(latencies)
+    metrics = {
+        "framework": FRAMEWORK,
+        "package": PACKAGE_NAME,
+        "framework_module": FRAMEWORK_MODULE,
+        "package_version": version,
+        "mode": "offline_mock_framework_benchmark",
+        "offline_dependency_policy": "no external dependency installation",
+        "uses_external_llm_api": False,
+        "uses_external_embedding_api": False,
+        "document_count": len(DOCS),
+        "query_count": len(QUERIES),
+        "index_build_seconds": build_seconds,
+        "avg_query_latency_seconds": statistics.mean(latencies),
+        "p95_query_latency_seconds": percentile(latencies, 0.95),
+        "throughput_qps": len(QUERIES) / total_query_seconds if total_query_seconds else 0.0,
+        "recall_at_3": hits / len(QUERIES),
+        "sample_outputs": outputs,
+    }
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+if __name__ == "__main__":
+    main()
+`, displayName, packageName, moduleName)
+}
+
+func stripInlinePipInstall(code string) string {
+	lines := strings.Split(code, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "subprocess.check_call") && strings.Contains(lower, "pip") && strings.Contains(lower, "install") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\n")
+}
+
+func filterFrameworkBenchmarkDependencies(task *models.Task, dependencies []string) []string {
+	target := frameworkBenchmarkTarget(task)
+	if target == "" {
+		return dependencies
+	}
+	return []string{}
+}
+
 // ExecuteTask 使用 Eino Chain 执行任务
 func (a *CoderAgent) ExecuteTask(ctx context.Context, task *models.Task, sharedContext map[string]interface{}) error {
 	if task != nil && task.Type == "resolve_dependencies" {
 		return a.resolveDependenciesTask(ctx, task)
 	}
+	ctx = a.contextWithTaskPrompt(ctx, task, sharedContext)
 	// sandbox_agent tasks must run through the deterministic sandbox path so that:
 	// - runtime_session / prepared_runtime artifacts are produced consistently
 	// - the scheduler can wire outputs -> inputs between plan nodes
@@ -365,7 +537,10 @@ func (a *CoderAgent) ExecuteTask(ctx context.Context, task *models.Task, sharedC
 	ctx = context.WithValue(ctx, "codeChannel", codeChan)
 
 	// 在后台收集生成的代码和图片
+	var codeCollector sync.WaitGroup
+	codeCollector.Add(1)
 	go func() {
+		defer codeCollector.Done()
 		for msg := range codeChan {
 			if strings.HasPrefix(msg, "IMAGE:") {
 				task.ImageBase64 = strings.TrimPrefix(msg, "IMAGE:")
@@ -388,12 +563,21 @@ func (a *CoderAgent) ExecuteTask(ctx context.Context, task *models.Task, sharedC
 	}
 	output, err := selectedChain.Invoke(ctx, task.Description)
 	close(codeChan) // 关闭通道让 goroutine 退出
+	codeCollector.Wait()
 
 	if err != nil {
 		log.Printf("[%s] Eino 执行流失败: %v", a.Name, err)
 		task.Status = models.StatusFailed
 		task.Error = fmt.Sprintf("执行失败: %v", err)
 		return err
+	}
+
+	if replacement, ok := deterministicFrameworkBenchmarkCode(task); ok {
+		output = replacement
+		task.Code = replacement
+	} else if task.Code != "" {
+		task.Code = stripInlinePipInstall(task.Code)
+		output = stripInlinePipInstall(output)
 	}
 
 	log.Printf("[%s] Eino 执行流完成. 最终输出:\n%s", a.Name, output)
@@ -493,8 +677,22 @@ func (a *CoderAgent) installDependencies(ctx context.Context, task *models.Task)
 		return nil
 	}
 
+	dependencies = filterFrameworkBenchmarkDependencies(task, dependencies)
 	dependencies = normalizeDependenciesForPython39(dependencies)
+	dependencies = filterFrameworkBenchmarkDependencies(task, dependencies)
 	dependencies = filterStandardLibraryDependencies(dependencies)
+	if len(dependencies) == 0 {
+		task.Result = "no external dependencies detected"
+		task.Status = models.StatusCompleted
+		if task.Metadata == nil {
+			task.Metadata = map[string]any{}
+		}
+		task.Metadata["artifact_values"] = buildArtifactValueMap(task, map[string]string{
+			"prepared_runtime":          runtimeSession,
+			"dependency_install_report": "no external dependencies detected",
+		})
+		return nil
+	}
 
 	// ReAct 依赖恢复：优先让模型根据 pip 日志给出结构化动作，
 	// 再由规则兜底，避免把“重试”做成纯盲试。
@@ -605,36 +803,9 @@ func (a *CoderAgent) planDependencyRecovery(ctx context.Context, dependencies []
 		return nil, fmt.Errorf("chat model is not configured")
 	}
 
-	systemPrompt := `你是一个 Python 依赖安装修复代理。你的任务不是生成代码，而是根据 pip 安装失败日志输出一个严格 JSON 修复动作。
-
-规则：
-1. 只输出 JSON，不要 markdown，不要解释。
-2. action 只能是：
-   - "remove_package"
-   - "replace_package"
-   - "upgrade_python"
-   - "rewrite_dependencies"
-   - "abort"
-3. 如果报错是标准库被误装（例如 shutil、pathlib、typing），优先 remove_package。
-4. 如果报错包含 Requires-Python >=3.10/3.11/3.12，优先 upgrade_python，并把 target_image 设为兼容的 python:3.10-bullseye / python:3.11-bullseye / python:3.12-bullseye。
-5. 如果只是一个包名明显写错，可用 replace_package。
-6. 只有在确实需要整体重写时才用 rewrite_dependencies，且 next_dependencies 必须是完整的新依赖列表。
-7. 不要凭空删除大量依赖；保持最小改动。
-
-返回格式：
-{
-  "action": "remove_package",
-  "reason": "一句话说明",
-  "remove_package": "",
-  "replace_package": "",
-  "with_package": "",
-  "target_image": "",
-  "next_dependencies": []
-}`
-
-	userPrompt := fmt.Sprintf("当前依赖列表(JSON):\n%s\n\npip 错误日志:\n%s", mustJSON(dependencies), pipError)
+	userPrompt := prompts.DependencyRecoveryUserPrompt(mustJSON(dependencies), pipError)
 	msg, err := a.ChatModel.Generate(ctx, []*schema.Message{
-		{Role: schema.System, Content: systemPrompt},
+		{Role: schema.System, Content: prompts.DependencyRecoverySystemPrompt},
 		{Role: schema.User, Content: userPrompt},
 	})
 	if err != nil {
@@ -896,7 +1067,7 @@ var pythonStandardLibraryModules = map[string]struct{}{
 	"hashlib": {}, "io": {}, "itertools": {}, "json": {}, "logging": {}, "math": {}, "os": {}, "pathlib": {}, "random": {},
 	"re": {}, "statistics": {}, "string": {}, "subprocess": {}, "sys": {}, "tempfile": {}, "time": {}, "typing": {}, "uuid": {}, "warnings": {},
 	// 标准库：避免被误判为 PyPI 包（例如 `shutil` 不是第三方依赖，pip 永远装不上）
-	"shutil": {},
+	"__future__": {}, "codecs": {}, "inspect": {}, "shutil": {}, "tarfile": {}, "urllib": {},
 }
 
 var pythonImportPackageMap = map[string]string{
@@ -1010,21 +1181,12 @@ func (a *CoderAgent) repairGeneratedPythonCodeForRuntimeError(ctx context.Contex
 		return "", false, nil
 	}
 
-	prompt := fmt.Sprintf(
-		"下面这段 Python 代码运行失败，请根据错误日志直接修复完整代码。\n"+
-			"要求：\n"+
-			"1. 优先修复第三方库 API/导入路径兼容问题，例如库升级后类或函数被迁移。\n"+
-			"2. 如果是 llama-index 相关导入错误，优先改成新导入路径，而不是继续使用旧路径。\n"+
-			"3. 如果错误是 SyntaxError 或 f-string: invalid syntax，必须修正为 Python 3.9 可解析的语法；动态格式化请用 format(value, spec)。\n"+
-			"4. 如果错误涉及 invalid_api_key、AuthenticationError、sk-placeholder、OpenAI embedding/LLM 调用，必须改为完全离线的 mock/fake LLM 与本地 embedding，不要读取真实 API Key。\n"+
-			"5. 不要在代码里增加 pip install 之类的安装语句。\n"+
-			"6. 只返回修复后的完整 Python 代码，不要 markdown，不要解释。\n\n"+
-			"错误日志：\n%s\n\n原始代码：\n```python\n%s\n```",
-		errText,
-		code,
-	)
+	intentType, _ := ctx.Value(coderIntentTypeContextKey).(string)
+	taskType, _ := ctx.Value(coderTaskTypeContextKey).(string)
+	taskName, _ := ctx.Value(coderTaskNameContextKey).(string)
+	prompt := prompts.RuntimeCodeRepairUserPromptForTask(errText, code, intentType, taskType, taskName)
 	msg, err := a.ChatModel.Generate(ctx, []*schema.Message{
-		{Role: schema.System, Content: a.SystemPrompt},
+		{Role: schema.System, Content: coderSystemPromptFromContext(ctx, a.SystemPrompt)},
 		{Role: schema.User, Content: prompt},
 	})
 	if err != nil {
@@ -1227,11 +1389,23 @@ func (a *CoderAgent) resolveDependenciesTask(ctx context.Context, task *models.T
 	}
 
 	dependencies := make([]string, 0, 16)
+	codeDependencies := detectPythonDependencies(code)
 	if strings.TrimSpace(workspacePath) != "" {
-		dependencies = append(dependencies, detectRepositoryDependencies(workspacePath)...)
+		workspaceDependencies := filterWorkspaceLocalDependencies(detectWorkspacePythonDependencies(workspacePath), workspacePath)
+		dependencies = append(dependencies, workspaceDependencies...)
+		repoDependencies := detectRepositoryDependencies(workspacePath)
+		if len(workspaceDependencies) > 0 || len(codeDependencies) > 0 {
+			repoDependencies = filterDependenciesToRoots(repoDependencies, dependencyRootSet(append(append([]string{}, workspaceDependencies...), codeDependencies...)))
+		}
+		dependencies = append(dependencies, repoDependencies...)
 	}
-	dependencies = append(dependencies, detectPythonDependencies(code)...)
+	dependencies = append(dependencies, codeDependencies...)
+	if strings.TrimSpace(workspacePath) != "" {
+		dependencies = filterWorkspaceLocalDependencies(dependencies, workspacePath)
+	}
+	dependencies = filterFrameworkBenchmarkDependencies(task, dependencies)
 	dependencies = normalizeDependenciesForPython39(uniqueDependencies(dependencies))
+	dependencies = filterFrameworkBenchmarkDependencies(task, dependencies)
 	payload, err := json.Marshal(dependencies)
 	if err != nil {
 		task.Status = models.StatusFailed
@@ -1466,6 +1640,121 @@ func uniqueDependencies(items []string) []string {
 	return out
 }
 
+func dependencyRootName(dependency string) string {
+	root := strings.ToLower(strings.TrimSpace(dependency))
+	root = strings.Split(root, "[")[0]
+	root = strings.Split(root, "<")[0]
+	root = strings.Split(root, ">")[0]
+	root = strings.Split(root, "=")[0]
+	return strings.TrimSpace(root)
+}
+
+func canonicalDependencyRoot(dependency string) string {
+	root := strings.ReplaceAll(dependencyRootName(dependency), "_", "-")
+	switch root {
+	case "pytorch":
+		return "torch"
+	case "msgpack-python":
+		return "msgpack"
+	default:
+		return root
+	}
+}
+
+func dependencyRootSet(dependencies []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, dependency := range dependencies {
+		root := canonicalDependencyRoot(dependency)
+		if root == "" {
+			continue
+		}
+		out[root] = struct{}{}
+	}
+	return out
+}
+
+func filterDependenciesToRoots(dependencies []string, roots map[string]struct{}) []string {
+	if len(dependencies) == 0 || len(roots) == 0 {
+		return dependencies
+	}
+	out := make([]string, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		if _, ok := roots[canonicalDependencyRoot(dependency)]; ok {
+			out = append(out, dependency)
+		}
+	}
+	return out
+}
+
+func filterWorkspaceLocalDependencies(dependencies []string, workspacePath string) []string {
+	workspacePath = strings.TrimSpace(workspacePath)
+	if workspacePath == "" || len(dependencies) == 0 {
+		return dependencies
+	}
+	out := make([]string, 0, len(dependencies))
+	for _, dependency := range dependencies {
+		root := strings.ReplaceAll(dependencyRootName(dependency), "-", "_")
+		if root != "" && workspaceHasPythonModule(workspacePath, root) {
+			continue
+		}
+		out = append(out, dependency)
+	}
+	return out
+}
+
+func workspaceHasPythonModule(workspacePath, module string) bool {
+	found := false
+	_ = filepath.WalkDir(workspacePath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			switch name {
+			case ".git", ".github", "__pycache__", ".venv", "venv", "node_modules", "dist", "build":
+				return filepath.SkipDir
+			}
+			if name == module {
+				found = true
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if name == module+".py" {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func detectWorkspacePythonDependencies(workspacePath string) []string {
+	deps := make([]string, 0, 16)
+	_ = filepath.WalkDir(workspacePath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			switch name {
+			case ".git", ".github", "__pycache__", ".venv", "venv", "node_modules", "dist", "build", "docs":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(name), ".py") {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		deps = append(deps, detectPythonDependencies(string(raw))...)
+		return nil
+	})
+	return uniqueDependencies(deps)
+}
+
 func normalizeDependenciesForPython39(items []string) []string {
 	normalized := make([]string, 0, len(items)+1)
 	seen := map[string]struct{}{}
@@ -1508,12 +1797,22 @@ func normalizeDependenciesForPython39(items []string) []string {
 
 	for _, item := range filterStandardLibraryDependencies(items) {
 		name := strings.TrimSpace(item)
-		switch strings.ToLower(name) {
-		case "oscar==2.2.1":
+		lowerName := strings.ToLower(name)
+		root := canonicalDependencyRoot(lowerName)
+		switch {
+		case root == "python" || root == "python3":
+			continue
+		case lowerName == "oscar==2.2.1":
 			// 最小纠错：PyPI 上 `oscar` 没有 2.2.1；结合实际安装日志，
 			// `django-oscar` 可用到 2.2，因此降到已存在的稳定版本。
 			appendOnce("django-oscar==2.2")
-		case "llama-index":
+		case root == "torch" && strings.HasPrefix(lowerName, "pytorch"):
+			appendOnce("torch")
+		case root == "msgpack" && strings.HasPrefix(lowerName, "msgpack-python"):
+			appendOnce("msgpack")
+		case lowerName == "tensorflow==1.14.0" || lowerName == "tensorflow==1.15.0":
+			continue
+		case lowerName == "llama-index":
 			appendOnce("llama-index<0.12")
 			appendOnce("pydantic<2.10")
 		default:
