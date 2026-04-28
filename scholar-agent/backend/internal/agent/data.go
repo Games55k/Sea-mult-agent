@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
+	"scholar-agent-backend/internal/appconfig"
 	"scholar-agent-backend/internal/models"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -36,24 +36,15 @@ func NewDataAgent() *DataAgent {
 }
 
 func (a *DataAgent) initEinoChain() {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		log.Fatal("OPENAI_API_KEY environment variable is not set")
-	}
-
-	baseURL := os.Getenv("OPENAI_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.deepseek.com/v1"
-	}
-	modelName := os.Getenv("OPENAI_MODEL_NAME")
-	if modelName == "" {
-		modelName = "deepseek-chat"
+	llmCfg, err := appconfig.LoadLLMConfig()
+	if err != nil {
+		log.Fatalf("加载 LLM 配置失败: %v", err)
 	}
 
 	chatModel, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
-		BaseURL: baseURL,
-		APIKey:  apiKey,
-		Model:   modelName,
+		BaseURL: llmCfg.BaseURL,
+		APIKey:  llmCfg.APIKey,
+		Model:   llmCfg.Model,
 	})
 	if err != nil {
 		log.Fatalf("初始化数据分析模型失败: %v", err)
@@ -92,10 +83,10 @@ func (a *DataAgent) initEinoChain() {
 
 func (a *DataAgent) ExecuteTask(ctx context.Context, task *models.Task, sharedContext map[string]interface{}) error {
 	logToContext(ctx, "[%s] 开始执行任务: %s", a.Name, task.Name)
-	
+
 	// Normally, we would extract the results from the sandbox file system here.
 	// For now, we will pass the description (which might contain the raw data/logs).
-	
+
 	output, err := a.EinoChain.Invoke(ctx, task.Description)
 	if err != nil {
 		logToContext(ctx, "[%s] 报告生成失败: %v", a.Name, err)

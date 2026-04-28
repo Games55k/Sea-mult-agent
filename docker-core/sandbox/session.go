@@ -14,13 +14,13 @@ import (
 // Session 管理与容器的 TTY 长连接会话
 // 通过 Docker Attach API 劫持 stdin/stdout，实现命令注入和输出捕获
 type Session struct {
-	engine       *Engine
-	conn         io.WriteCloser // TTY stdin（hijacked connection）
-	splitter     *StreamSplitter
-	envMap       map[string]string // 持久化环境变量映射
-	envSynced    map[string]string // 已同步到容器的环境变量（避免重复注入）
-	mu           sync.Mutex
-	timeout      time.Duration
+	engine    *Engine
+	conn      io.WriteCloser // TTY stdin（hijacked connection）
+	splitter  *StreamSplitter
+	envMap    map[string]string // 持久化环境变量映射
+	envSynced map[string]string // 已同步到容器的环境变量（避免重复注入）
+	mu        sync.Mutex
+	timeout   time.Duration
 }
 
 // NewSession 通过 ContainerAttach 劫持 TTY，建立持久会话
@@ -81,31 +81,79 @@ func (s *Session) Execute(ctx context.Context, command string) (*ExecResult, err
 	}
 
 	// 3. 构造包装命令：执行原命令 → 输出 delimiter + 退出码
-	wrappedCmd := fmt.Sprintf("%s\necho \"%s:$?\"\n", command, delimiter)
+	// 关键：将命令 stdin 重定向到 /dev/null，防止 apt/dpkg 等子进程吞掉后续 echo 行。
+	wrappedCmd := fmt.Sprintf("(%s) </dev/null\necho \"%s:$?\"\n", command, delimiter)
 	if _, err := io.WriteString(s.conn, wrappedCmd); err != nil {
 		return nil, fmt.Errorf("failed to write command: %w", err)
 	}
 
 	// 4. 设置超时
 	timeoutCh := make(chan struct{})
+	var timeoutOnce sync.Once
+	closeTimeout := func() {
+		timeoutOnce.Do(func() {
+			close(timeoutCh)
+		})
+	}
+
 	var timer *time.Timer
 	if s.timeout > 0 {
 		timer = time.AfterFunc(s.timeout, func() {
-			close(timeoutCh)
+			closeTimeout()
 			// 超时后发送 Ctrl+C 中断命令，而不是杀死沙箱
 			io.WriteString(s.conn, "\x03\n")
 		})
 		defer timer.Stop()
 	}
 
-	// 5. 从 splitter 读取输出直到遇到 delimiter
+	// 让执行可被上层 context 取消（例如 watchdog 的 command timeout）。
+	ctxWatchDone := make(chan struct{})
+	defer close(ctxWatchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeTimeout()
+			io.WriteString(s.conn, "\x03\n")
+		case <-ctxWatchDone:
+			return
+		}
+	}()
+
+	// 5. nudge goroutine：检测 Docker Desktop (Windows) 缓冲问题
+	// 当长时间（8秒）无新输出时，发送 \n 触发 bash 输出 prompt，
+	// 从而强制 Docker 刷新其缓冲区（包括已卡住的 delimiter echo 输出）
+	nudgeDone := make(chan struct{})
+	defer close(nudgeDone)
+	go func() {
+		const nudgeInterval = 8 * time.Second
+		ticker := time.NewTicker(nudgeInterval)
+		defer ticker.Stop()
+		prevCount := s.splitter.LineCount()
+		for {
+			select {
+			case <-ticker.C:
+				curCount := s.splitter.LineCount()
+				if curCount == prevCount {
+					// 8 秒内无新行 → 发送 \n 刷新 Docker 缓冲
+					io.WriteString(s.conn, "\n")
+				}
+				prevCount = curCount
+			case <-nudgeDone:
+				return
+			case <-timeoutCh:
+				return
+			}
+		}
+	}()
+
+	// 6. 从 splitter 读取输出直到遇到 delimiter
 	output, exitCode := s.splitter.ReadUntilDelimiter(delimiter, timeoutCh)
 
-	// 6. 过滤掉 echo 命令本身的回显和 export 命令的回显
+	// 7. 过滤掉 echo 命令本身的回显和 export 命令的回显
 	output = filterEchoLine(output, delimiter)
 	output = filterExportEcho(output)
 
-	// 7. 如果是 export 命令，同步更新 envMap
+	// 8. 如果是 export 命令，同步更新 envMap
 	trimmed := strings.TrimSpace(command)
 	if strings.HasPrefix(trimmed, "export ") {
 		s.parseAndStoreExport(trimmed)

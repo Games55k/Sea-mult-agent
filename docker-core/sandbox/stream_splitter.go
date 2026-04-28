@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,7 @@ func (ss *StreamSplitter) Run() {
 		n, err := ss.reader.Read(buf)
 		if n > 0 {
 			chunk := partial + string(buf[:n])
+			chunk = strings.ReplaceAll(chunk, "\r", "\n")
 			partial = ""
 
 			// 按行切分
@@ -117,17 +119,12 @@ func (ss *StreamSplitter) ReadUntilDelimiter(delimiter string, timeoutCh <-chan 
 		// 扫描新到达的行
 		for i := scanFrom; i < len(ss.lines); i++ {
 			line := ss.lines[i]
-			// 真正的退出码输出行应该是 "DELIMITER:CODE" 格式，且不应包含 "echo" 命令本身
-			if strings.Contains(line, delimiter) && !strings.Contains(line, "echo ") {
-				// 解析退出码
-				exitCode := 0
-				if idx := strings.LastIndex(line, ":"); idx != -1 {
-					fmt.Sscanf(line[idx+1:], "%d", &exitCode)
-				}
-				// 清除已消费的行
+			// 容错解析 delimiter：只要出现 "DELIMITER:<int>" 即认为命中。
+			// 这样即使该行同时包含 echo 回显，也能正确识别退出码。
+			if code, ok := parseDelimiterExitCode(line, delimiter); ok {
 				ss.lines = ss.lines[i+1:]
 				ss.mu.Unlock()
-				return strings.Join(collected, "\n"), exitCode
+				return strings.Join(collected, "\n"), code
 			}
 			collected = append(collected, line)
 		}
@@ -155,7 +152,44 @@ func (ss *StreamSplitter) ReadUntilDelimiter(delimiter string, timeoutCh <-chan 
 	}
 }
 
+func parseDelimiterExitCode(line string, delimiter string) (int, bool) {
+	key := delimiter + ":"
+	idx := strings.LastIndex(line, key)
+	if idx == -1 {
+		return 0, false
+	}
+	rest := strings.TrimSpace(line[idx+len(key):])
+	if rest == "" {
+		return 0, false
+	}
+
+	// 仅提取前缀整数，容忍后面紧跟 prompt 文本（例如 "0root@..."）。
+	start := 0
+	if rest[0] == '+' || rest[0] == '-' {
+		start = 1
+	}
+	end := start
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == start {
+		return 0, false
+	}
+	code, err := strconv.Atoi(rest[:end])
+	if err != nil {
+		return 0, false
+	}
+	return code, true
+}
+
 // Close 关闭审计日志文件
 func (ss *StreamSplitter) Close() error {
 	return ss.auditFile.Close()
+}
+
+// LineCount 返回当前推理缓冲中的行数（用于检测输出是否停止增长）
+func (ss *StreamSplitter) LineCount() int {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return len(ss.lines)
 }

@@ -1,4 +1,4 @@
-package executor_test
+package tests
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 )
 
 // 真人真实集成测试：需要 Docker 环境以及正确的 DeepSeek API Key
-// 运行命令: $env:REAL_INTEGRATION_TEST=1; go test -v executor/real_integration_test.go
+// 运行命令: $env:REAL_INTEGRATION_TEST=1; go test -v ./tests -run TestRealIntegration_FullFlow
 func TestRealIntegration_FullFlow(t *testing.T) {
 	if os.Getenv("REAL_INTEGRATION_TEST") == "" {
 		t.Skip("跳过真实集成测试。如需运行，请设置环境变量 REAL_INTEGRATION_TEST=1")
@@ -24,7 +24,6 @@ func TestRealIntegration_FullFlow(t *testing.T) {
 
 	fmt.Println("\n=== [Real Integration] 开始全组件真实集成测试 (Docker + LLM) ===")
 
-	// 1. 加载真实配置 (config.toml)
 	cfg, err := config.LoadConfig("../config/config.toml")
 	if err != nil {
 		t.Fatalf("加载配置失败: %v", err)
@@ -36,11 +35,10 @@ func TestRealIntegration_FullFlow(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 2. 初始化底层 Sandbox (真实 Docker)
 	sbCfg := sandbox.DefaultConfig()
-	sbCfg.Runtime = "runc" // Windows Docker Desktop 默认
+	sbCfg.Runtime = "runc"
 	sbCfg.AuditLogDir = t.TempDir()
-	
+
 	fmt.Println("[Step 1] 正在启动真实 Docker 沙箱...")
 	realSandbox, err := sandbox.New(ctx, sbCfg)
 	if err != nil {
@@ -49,15 +47,12 @@ func TestRealIntegration_FullFlow(t *testing.T) {
 	defer realSandbox.Close()
 	fmt.Printf("[Step 1] 沙箱已就绪, ContainerID: %s\n", realSandbox.Engine().ContainerID()[:12])
 
-	// 3. 初始化 Checkpoint 管理器 (真实 Commit/Rollback 逻辑)
 	fmt.Println("[Step 2] 初始化快照管理器...")
 	cpManager := checkpoint.NewManager(realSandbox)
 
-	// 4. 初始化 Agent (真实连接 LLM)
 	fmt.Println("[Step 3] 初始化分布式 Agent (DeepSeek)...")
 	agent := executor.NewExecutorAgent(cfg.LLM)
 
-	// 5. 初始化 Watchdog，并将 Sandbox 和 Checkpoint 注入
 	fmt.Println("[Step 4] 组装 Watchdog 守护层...")
 	wdCfg := watchdog.Config{
 		MaxRetryWindow: cfg.Watchdog.MaxRetryWindow,
@@ -65,26 +60,20 @@ func TestRealIntegration_FullFlow(t *testing.T) {
 	}
 	safeBox := watchdog.NewWatchdog(wdCfg, realSandbox, cpManager, agent)
 
-	// 6. 初始化 Engine，核心调度引擎
 	fmt.Println("[Step 5] 启动调度引擎 Engine...")
 	engine := executor.NewEngine(nil, safeBox, cpManager, agent)
 
-	// 7. 构造一个包含故障的任务图来验证 Watchdog 的拦截和诊断能力
 	graph := executor.NewDAG()
-	// 节点 1: 正常操作
 	node1 := graph.AddNode("setup_check", []string{"uname -a", "ls /"})
-	// 节点 2: 故意尝试一个权限错误或不存在路径的操作，触发错误
 	node2 := graph.AddNode("trigger_diagnostic", []string{"ls /root/secret_vintces_folder"})
 	graph.AddEdge(node1, node2)
 
 	fmt.Println("\n[Execution] 引擎开始执行任务图...")
 	err = engine.ExecuteGraph(ctx, graph)
 
-	// 8. 验证结果
 	if err != nil {
 		fmt.Printf("\n[Result] 引擎捕获到错误 (符合预期): %v\n", err)
-		
-		// 检查错误类型是否由 Watchdog 抛出且包含 AI 建议
+
 		var wdErr *watchdog.WatchdogError
 		if errors.As(err, &wdErr) && wdErr.Type == watchdog.ErrTypeEnvironmentCorrupted {
 			fmt.Println("--------------------------------------------------")
@@ -92,8 +81,7 @@ func TestRealIntegration_FullFlow(t *testing.T) {
 			fmt.Printf("故障指令: %s\n", wdErr.Command)
 			fmt.Printf("AI 诊断建议: %s\n", wdErr.Hint)
 			fmt.Println("--------------------------------------------------")
-			
-			// 可选：测试回滚能力
+
 			fmt.Println("[Step 6] 测试回滚至最近安全节点...")
 			latestSnap, ok := cpManager.Registry().GetLatest()
 			if !ok {

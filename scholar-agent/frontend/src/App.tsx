@@ -1,8 +1,8 @@
-import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Background, Controls, ReactFlow, useNodesState, useEdgesState, Panel } from '@xyflow/react';
 import type { Node, Edge } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Send, Bot, FileText, Code, Database, TerminalSquare, Play, X, Eye, FileUp, Maximize2, Minimize2, Languages, Loader2, Sparkles, ChevronDown, ChevronUp } from 'lucide-react';
+import { Send, Bot, FileText, Code, Database, TerminalSquare, Play, X, Eye, FileUp, Maximize2, Languages, Loader2, Sparkles, ChevronDown, ChevronUp } from 'lucide-react';
 import axios from 'axios';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -169,8 +169,8 @@ export default function App() {
     setChatHistory(prev => [...prev, { role: 'user', text: userPrompt }]);
     setPrompt(''); // 清空输入框
     
-    // 智能判断意图：是否包含任务触发关键词
-    const isTaskRequest = /对比|评估|选型|RAG|复现|跑一下|执行|画|绘图|plot|matplotlib/.test(userPrompt);
+    // 智能判断意图：是否包含任务触发关键词（扩展版）
+    const isTaskRequest = /对比|比较|评估|选型|RAG|复现|跑一下|执行|画|绘图|plot|matplotlib|langchain|llamaindex|llama.index|haystack|框架|配环境|安装依赖|vs\b/.test(userPrompt.toLowerCase());
     
     try {
       if (isTaskRequest) {
@@ -390,21 +390,38 @@ export default function App() {
   const handleRunAllTasks = async () => {
     if (isExecuting) return;
     
-    // 找出所有未完成的任务，按节点在数组中的顺序依次执行 (Planner 生成的顺序通常是合理的)
+    // 找出所有未完成的任务，按依赖关系拓扑排序后依次执行
     const taskNodes = nodes.filter(n => n.data.task && n.data.status !== 'completed');
+    
+    // 构建任务完成结果的共享上下文，用于将上游结果传递给下游任务
+    const taskResults: Record<string, string> = {};
     
     setChatHistory(prev => [...prev, { 
       role: 'system', 
       text: `🚀 开始全自动流水线任务！共需执行 ${taskNodes.length} 个节点，请耐心等待。` 
     }]);
-
+    
     for (const node of taskNodes) {
       const task = node.data.task as Task;
+      
+      // 将所有依赖任务的结果拼接到当前任务的描述中
+      const depResults: string[] = [];
+      for (const depId of (task.Dependencies || [])) {
+        if (taskResults[depId]) {
+          depResults.push(`\n\n===上游任务 [${depId.substring(0, 8)}] 的执行结果===\n${taskResults[depId].substring(0, 3000)}`);
+        }
+      }
+      
+      const enrichedTask: Task = depResults.length > 0
+        ? { ...task, Description: task.Description + depResults.join('') }
+        : task;
+      
       try {
-        await handleExecuteTask(task);
+        await handleExecuteTask(enrichedTask);
+        // 保存当前任务结果，供下游使用
+        taskResults[task.ID] = nodeStates[task.ID]?.result || '';
       } catch (e) {
         console.error(`Task ${task.Name} failed:`, e);
-        // 如果中间有一个失败了，可以选择停止
         setChatHistory(prev => [...prev, { 
           role: 'system', 
           text: `⚠️ 流水线在节点 **[${task.Name}]** 处中断。后续节点已取消自动执行。` 

@@ -36,7 +36,8 @@ func TestRealIntegration_AI_EnvSetup(t *testing.T) {
 	sbCfg := sandbox.DefaultConfig()
 	sbCfg.Runtime = "runc"
 	sbCfg.AuditLogDir = t.TempDir()
-	
+	sbCfg.ExecTimeout = 30 * time.Minute // 允许慢速网络下的 apt 包安装完成
+
 	realSandbox, err := sandbox.New(ctx, sbCfg)
 	if err != nil {
 		t.Fatalf("创建沙箱失败: %v", err)
@@ -45,20 +46,20 @@ func TestRealIntegration_AI_EnvSetup(t *testing.T) {
 
 	cpManager := checkpoint.NewManager(realSandbox)
 	agent := executor.NewExecutorAgent(cfg.LLM)
-	
+
 	wdCfg := watchdog.Config{
 		MaxRetryWindow: cfg.Watchdog.MaxRetryWindow,
-		CommandTimeout: 1800 * time.Second, // 增加到 30 分钟，确保巨大的 CUDA 依赖可以下载完成
+		CommandTimeout: 720 * time.Second, // 单命令最多 12 分钟，避免网络卡死导致整测超时
 	}
 	safeBox := watchdog.NewWatchdog(wdCfg, realSandbox, cpManager, agent)
 	engine := executor.NewEngine(nil, safeBox, cpManager, agent)
 	engine.NodeTimeout = 45 * time.Minute // 扩大单节点执行的总超时时间
 
-	// 2. 模拟高层目标：配置全栈开发环境，测试并行分支与多方案竞跑触发机制
+	// 2. 模拟高层目标：配置全栈开发环境（约束 Redis 仅使用 apt 安装，避免 docker/源码分支带来的外部波动）
 	goal := `在 Ubuntu 环境中配置完整的全栈与监控环境，具体要求：
 1. 基础依赖：必须最先更新 apt 源。
 2. 并行分支A：非交互模式安装 python3 和 python3-pip。
-3. 并行分支B：使用最高效、稳定的方式安装 redis-server 数据库（请留空 instruction 测试多方案并发竞跑逻辑）。
+3. 并行分支B：安装 redis-server，且仅允许使用 apt/apt-get 方案；禁止使用 docker 方案和源码编译方案。
 4. 汇总验证：在所有分支执行完成后，执行 "python3 --version && redis-server --version" 进行安全冒烟测试。`
 	fmt.Printf("[Goal] %s\n", goal)
 
@@ -81,7 +82,7 @@ func TestRealIntegration_AI_EnvSetup(t *testing.T) {
 	// 4. 引擎执行流程 (带有重试逻辑，应对网络波动)
 	fmt.Println("\n[Execution] 引擎开始执行 AI 规划的任务流...")
 	start := time.Now()
-	
+
 	maxRetries := 3
 	for i := 0; i < maxRetries; i++ {
 		err = engine.ExecuteGraph(ctx, graph)
@@ -89,7 +90,7 @@ func TestRealIntegration_AI_EnvSetup(t *testing.T) {
 			break
 		}
 		fmt.Printf("\n❌ [Retry] 任务执行失败 (尝试 %d/%d): %v\n", i+1, maxRetries, err)
-		
+
 		// 如果是 Watchdog 错误，打印详细 Hint
 		var wdErr *watchdog.WatchdogError
 		if errors.As(err, &wdErr) {

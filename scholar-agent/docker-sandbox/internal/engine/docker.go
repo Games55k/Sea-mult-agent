@@ -8,8 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+var containerIDPattern = regexp.MustCompile(`^[a-f0-9]{12,64}$`)
 
 type NativeDockerEngine struct {
 	mountPaths map[string]string // 记录容器 ID 到宿主机挂载路径的映射
@@ -37,11 +40,28 @@ func (e *NativeDockerEngine) Create(ctx context.Context, image string, mountPath
 	if err != nil {
 		return "", fmt.Errorf("Docker run failed: %v, output: %s", err, string(output))
 	}
-	containerID := strings.TrimSpace(string(output))
+	containerID, err := extractContainerID(string(output))
+	if err != nil {
+		return "", fmt.Errorf("解析容器 ID 失败: %w, output: %s", err, string(output))
+	}
 	if mountPath != "" {
 		e.mountPaths[containerID] = mountPath
 	}
 	return containerID, nil
+}
+
+func extractContainerID(raw string) (string, error) {
+	lines := strings.Split(raw, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if containerIDPattern.MatchString(line) {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("未找到合法容器 ID")
 }
 
 func (e *NativeDockerEngine) Delete(ctx context.Context, id string) error {

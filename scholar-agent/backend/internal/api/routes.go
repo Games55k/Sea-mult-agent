@@ -13,6 +13,7 @@ import (
 	"scholar-agent-backend/internal/models"
 	"scholar-agent-backend/internal/planner"
 	"scholar-agent-backend/internal/sandbox"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -73,6 +74,8 @@ func SetupRoutes(r *gin.Engine) {
 		apiGroup.OPTIONS("/*path", func(c *gin.Context) {
 			c.Status(204)
 		})
+
+		RegisterPlanRoute(apiGroup, p)
 
 		apiGroup.GET("/hello", func(c *gin.Context) {
 			c.String(200, "hello api group")
@@ -145,35 +148,6 @@ func SetupRoutes(r *gin.Engine) {
 			}
 		})
 
-		apiGroup.POST("/plan", func(c *gin.Context) {
-			var payload RequestPayload
-			if err := c.ShouldBindJSON(&payload); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-
-			intentType := "General"
-			if contains(payload.Intent, []string{"对比", "评估", "选型", "RAG"}) {
-				intentType = "Framework_Evaluation"
-			} else if contains(payload.Intent, []string{"复现"}) {
-				intentType = "Paper_Reproduction"
-			} else if contains(payload.Intent, []string{"计算", "代码", "运行", "执行", "画图", "分析"}) {
-				intentType = "Code_Execution"
-			}
-
-			plan, err := p.GeneratePlan(payload.Intent, intentType)
-			if err != nil {
-				log.Printf("Error generating plan: %v", err)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate plan"})
-				return
-			}
-
-			c.JSON(http.StatusOK, gin.H{
-				"message": "Plan generated successfully",
-				"plan":    plan,
-			})
-		})
-
 		apiGroup.POST("/execute", func(c *gin.Context) {
 			var payload ExecutePayload
 			if err := c.ShouldBindJSON(&payload); err != nil {
@@ -217,26 +191,25 @@ func SetupRoutes(r *gin.Engine) {
 			_ = os.MkdirAll(workspacePath, 0777)
 
 			// Initialize persistent sandbox for this task
+			// 先同步创建沙箱，再将 containerID 注入 context，避免 goroutine 内竞态
 			var containerID string
-			go func() {
-				if sb != nil {
-					logChannel <- "[System] 正在通过 OpenSandbox 服务分配持久化沙箱环境..."
-					var err error
-					containerID, err = sb.CreatePersistentSandbox(ctx, task.ID, "python:3.9-bullseye", workspacePath)
-					if err != nil {
-						logChannel <- fmt.Sprintf("[Error] 创建沙箱失败: %v", err)
-					} else {
-						typeStr := "OpenSandbox"
-						if len(containerID) > 3 && containerID[:3] == "dk-" {
-							typeStr = "原生 Docker (已启动兜底方案)"
-						} else if len(containerID) > 3 && containerID[:3] == "os-" {
-							typeStr = "OpenSandbox"
-						}
-						logChannel <- fmt.Sprintf("[System] %s 沙箱创建成功 (ID: %s)", typeStr, containerID)
-						ctx = context.WithValue(ctx, "containerID", containerID)
+			if sb != nil {
+				logChannel <- "[System] 正在通过 OpenSandbox 服务分配持久化沙箱环境..."
+				var sandboxErr error
+				containerID, sandboxErr = sb.CreatePersistentSandbox(ctx, task.ID, "python:3.9-bullseye", workspacePath)
+				if sandboxErr != nil {
+					logChannel <- fmt.Sprintf("[Warning] 创建沙箱失败，将降级为临时沙箱模式: %v", sandboxErr)
+				} else {
+					typeStr := "OpenSandbox"
+					if len(containerID) > 3 && containerID[:3] == "dk-" {
+						typeStr = "原生 Docker (已启动兜底方案)"
 					}
+					logChannel <- fmt.Sprintf("[System] %s 沙箱创建成功 (ID: %s)", typeStr, containerID)
+					ctx = context.WithValue(ctx, "containerID", containerID)
 				}
+			}
 
+			go func() {
 				var err error
 				switch task.AssignedTo {
 				case "librarian_agent":
@@ -310,15 +283,68 @@ func SetupRoutes(r *gin.Engine) {
 	}
 }
 
-func contains(s string, keywords []string) bool {
+func RegisterPlanRoute(apiGroup *gin.RouterGroup, p *planner.Planner) {
+	apiGroup.POST("/plan", func(c *gin.Context) {
+		var payload RequestPayload
+		if err := c.ShouldBindJSON(&payload); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		intentType := DetectIntentType(payload.Intent)
+
+		plan, err := p.GeneratePlan(payload.Intent, intentType)
+		if err != nil {
+			log.Printf("Error generating plan: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate plan"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Plan generated successfully",
+			"plan":    plan,
+		})
+	})
+}
+
+// detectIntentType 根据用户意图文本判断任务类型
+func DetectIntentType(intent string) string {
+	// 框架对比评测类关键词（扩展版）
+	evalKeywords := []string{
+		"对比", "比较", "评估", "选型", "哪个好", "哪个更", "区别", "异同",
+		"rag", "langchain", "llamaindex", "llama_index", "haystack",
+		"dspy", "autogen", "crewai", "langgraph", "framework",
+		"框架", "测试两", "比一比", "pk", "vs",
+	}
+	if containsAny(intent, evalKeywords) {
+		return "Framework_Evaluation"
+	}
+
+	// 论文复现类
+	reproKeywords := []string{"复现", "reproduce", "论文", "paper", "arxiv", "实现算法"}
+	if containsAny(intent, reproKeywords) {
+		return "Paper_Reproduction"
+	}
+
+	// 代码执行类
+	codeKeywords := []string{
+		"计算", "代码", "运行", "执行", "画图", "分析", "写一个", "生成代码",
+		"跑一下", "plot", "matplotlib", "numpy", "python",
+	}
+	if containsAny(intent, codeKeywords) {
+		return "Code_Execution"
+	}
+
+	return "General"
+}
+
+// containsAny 检查字符串是否包含任意一个关键词（忽略大小写）
+func containsAny(s string, keywords []string) bool {
+	lower := strings.ToLower(s)
 	for _, k := range keywords {
-		// Simple substring match for demo
-		if len(s) >= len(k) {
-			for i := 0; i <= len(s)-len(k); i++ {
-				if s[i:i+len(k)] == k {
-					return true
-				}
-			}
+		kLower := strings.ToLower(k)
+		if strings.Contains(lower, kLower) {
+			return true
 		}
 	}
 	return false

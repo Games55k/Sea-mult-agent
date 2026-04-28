@@ -42,6 +42,11 @@ func (w *Watchdog) Execute(ctx context.Context, cmd string) (string, error) {
 	// 2. 执行命令
 	output, err := w.box.Execute(execCtx, cmd)
 
+	// 节点竞速模式下，胜出分支会取消其余分支；这类 context canceled 不是故障，不应进入审计。
+	if execCtx.Err() == context.Canceled {
+		return output, context.Canceled
+	}
+
 	// 3. 处理执行结果 (优先检查超时)
 	if execCtx.Err() == context.DeadlineExceeded {
 		return "", &WatchdogError{
